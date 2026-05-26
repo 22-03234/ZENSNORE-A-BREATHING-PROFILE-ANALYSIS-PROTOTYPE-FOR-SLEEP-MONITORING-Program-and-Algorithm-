@@ -7,26 +7,33 @@ This repository contains the source codes, embedded system programs, signal proc
 
 ---
 
-## Features
-- Airflow monitoring through nasal cannula sensing
-- Snoring sound acquisition and analysis
-- Pulse oximetry integration (SpO₂ and heart rate)
-- Multimodal physiological data collection
-- Signal processing and filtering
-- Embedded system implementation using Arduino/Raspberry Pi
-- Data logging for sleep analysis
+## System Components
+
+### _Hardware Components_
+- Raspberry Pi Zero 2 W
+- INMP441 I2S MEMS Microphone
+- MPXV7002DP Differential Pressure Sensor
+- ADS1115 Analog-to-Digital Converter
+- Nasal Cannula
+- MAX30102 Pulse Oximeter Sensor
 
 ---
 
-## Technologies Used
-- Arduino
-- Raspberry Pi
+## Software and Programming
 - Python
-- C/C++
-- Signal Processing Techniques
-- Pulse Oximetry Sensors
-- Sound and Airflow Sensors
+- MATLAB
+- Raspberry Pi OS
 
+---
+
+## Features
+- Airflow monitoring and recording
+- Snoring sound acquisition and analysis
+- Pulse oximetry monitoring (SpO₂ and Heart Rate)
+- Multimodal physiological data collection
+- Signal processing and filtering
+- Data logging and analysis
+- Wearable and non-invasive system implementation
 ---
 
 ## Repository Structure
