@@ -1,0 +1,372 @@
+%% ============================================================
+%  ZENSNORE FINAL AIRFLOW PIPELINE (LOCKED / TIME-ALIGNED)
+%  Uses TRUE 30-second time-based epoching for safe multimodal fusion
+%
+%  INPUT:
+%    airflow.csv
+%
+%  OUTPUT:
+%    airflow_epoch_final_classification.csv
+%    airflow_apnea_events.csv
+%    airflow_signal_trace.csv
+%
+%  NOTES:
+%   - Updated using corrected normalized threshold-building results
+%   - Uses locked final rule from best rule-combination sweep:
+%         RuleA_AND
+%         RMS_norm < 0.90511
+%         LocalRange_norm < 0.96195
+%   - Safe for multimodal fusion with sound / SpO2 / HR
+%% ============================================================
+clc;
+clear;
+close all;
+fprintf('\n============================================================\n');
+fprintf(' ZENSNORE FINAL AIRFLOW PIPELINE (LOCKED / TIME-ALIGNED)\n');
+fprintf('============================================================\n');
+%% ------------------------------------------------------------
+% USER SETTINGS
+%% ------------------------------------------------------------
+inputFile = 'airflow.csv';
+% Locked preprocessing settings
+lp_cutoff_hz            = 1.0;
+butter_order            = 4;
+% Locked epoch settings
+epoch_sec               = 30;
+% Locked apnea/event settings
+apnea_reduction_frac    = 0.10;   % <=10% of baseline = apnea-like drop
+apnea_min_duration_sec  = 10;     % minimum apnea duration
+baseline_win_sec        = 60;     % local baseline window
+env_smooth_sec          = 1.0;    % envelope smoothing
+% Locked breath detection settings
+min_peak_distance_sec   = 1.5;
+% -------------------------------------------------------------
+% UPDATED LOCKED FINAL DECISION THRESHOLDS
+% Derived from corrected normalized threshold-building path
+% Best overall rule = RuleA_AND
+% -------------------------------------------------------------
+TH_RMS_NORM_APNEA       = 0.90511;
+TH_LR_NORM_APNEA        = 0.96195;
+TH_APNEA_OVERLAP_SEC    = 10;
+% Optional output folder
+outDir = fullfile(pwd, 'airflow_outputs');
+%% ------------------------------------------------------------
+% LOAD RAW AIRFLOW
+%% ------------------------------------------------------------
+if ~isfile(inputFile)
+   error('Input file not found: %s', inputFile);
+end
+Traw = readtable(inputFile);
+vn = Traw.Properties.VariableNames;
+% Detect time column
+if ismember('t_ns', vn)
+   t = double(Traw.t_ns) * 1e-9;
+elseif ismember('time_s', vn)
+   t = double(Traw.time_s);
+elseif ismember('Time_s', vn)
+   t = double(Traw.Time_s);
+elseif ismember('t', vn)
+   t = double(Traw.t);
+else
+   error('No recognized time column found. Expected t_ns or time_s.');
+end
+% Detect airflow/pressure column
+if ismember('pressure_kpa_zeroed', vn)
+   x = double(Traw.pressure_kpa_zeroed);
+elseif ismember('pressure_kpa', vn)
+   x = double(Traw.pressure_kpa);
+elseif ismember('airflow', vn)
+   x = double(Traw.airflow);
+elseif ismember('signal', vn)
+   x = double(Traw.signal);
+else
+   error('No recognized airflow signal column found.');
+end
+valid = isfinite(t) & isfinite(x);
+t = t(valid);
+x = x(valid);
+% Start time at zero
+t = t - t(1);
+N = numel(x);
+if N < 10
+   error('Too few samples after cleaning.');
+end
+dt = median(diff(t), 'omitnan');
+Fs = 1 / dt;
+fprintf('\n[STEP 0] LOADING RAW AIRFLOW FILE\n');
+fprintf('Input file                  : %s\n', inputFile);
+fprintf('Total samples               : %d\n', N);
+fprintf('Estimated sampling rate     : %.4f Hz\n', Fs);
+fprintf('Recording duration          : %.2f s (%.2f min, %.2f hr)\n', ...
+   t(end), t(end)/60, t(end)/3600);
+%% ------------------------------------------------------------
+% FILTER AIRFLOW
+%% ------------------------------------------------------------
+fprintf('\n[STEP 1] FILTERING AIRFLOW SIGNAL\n');
+x_centered = x - median(x, 'omitnan');
+[b, a] = butter(butter_order, lp_cutoff_hz / (Fs/2), 'low');
+x_filt = filtfilt(b, a, x_centered);
+fprintf('Filter type                 : %dth-order Butterworth low-pass\n', butter_order);
+fprintf('Cutoff frequency            : %.2f Hz\n', lp_cutoff_hz);
+fprintf('Filtered mean (centered)    : %.6f\n', mean(x_filt, 'omitnan'));
+fprintf('Filtered std                : %.6f\n', std(x_filt, 'omitnan'));
+%% ------------------------------------------------------------
+% ENVELOPE + LOCAL BASELINE
+%% ------------------------------------------------------------
+fprintf('\n[STEP 2] ENVELOPE / BASELINE ESTIMATION\n');
+env_win = max(3, round(env_smooth_sec * Fs));
+x_env = movmean(abs(x_filt), env_win, 'omitnan');
+baseline_win = max(3, round(baseline_win_sec * Fs));
+local_baseline = movmedian(x_env, baseline_win, 'omitnan');
+% Prevent divide-by-zero
+local_baseline(local_baseline < eps) = eps;
+%% ------------------------------------------------------------
+% CONTINUOUS APNEA EVENT DETECTION
+%% ------------------------------------------------------------
+fprintf('\n[STEP 3] CONTINUOUS APNEA EVENT DETECTION\n');
+apnea_mask = x_env <= (apnea_reduction_frac .* local_baseline);
+% Find contiguous apnea-like runs
+dmask = diff([0; apnea_mask(:); 0]);
+run_starts = find(dmask == 1);
+run_ends   = find(dmask == -1) - 1;
+eventStart_s = [];
+eventEnd_s   = [];
+eventDur_s   = [];
+for k = 1:numel(run_starts)
+   sIdx = run_starts(k);
+   eIdx = run_ends(k);
+   dur = t(eIdx) - t(sIdx);
+   if dur >= apnea_min_duration_sec
+       eventStart_s(end+1,1) = t(sIdx); %#ok<AGROW>
+       eventEnd_s(end+1,1)   = t(eIdx); %#ok<AGROW>
+       eventDur_s(end+1,1)   = dur;     %#ok<AGROW>
+   end
+end
+numApneaEventsTotal = numel(eventDur_s);
+fprintf('Apnea reduction threshold   : <= %.0f%% of local baseline\n', apnea_reduction_frac*100);
+fprintf('Minimum apnea duration      : %.2f s\n', apnea_min_duration_sec);
+fprintf('Detected apnea-like events  : %d\n', numApneaEventsTotal);
+ApneaEvents = table;
+if numApneaEventsTotal > 0
+   ApneaEvents.EventNumber  = (1:numApneaEventsTotal)';
+   ApneaEvents.StartTime_s  = eventStart_s;
+   ApneaEvents.EndTime_s    = eventEnd_s;
+   ApneaEvents.Duration_s   = eventDur_s;
+else
+   ApneaEvents = table([], [], [], [], ...
+       'VariableNames', {'EventNumber','StartTime_s','EndTime_s','Duration_s'});
+end
+%% ------------------------------------------------------------
+% TRUE TIME-BASED 30-SECOND EPOCHING
+%% ------------------------------------------------------------
+fprintf('\n[STEP 4] TRUE TIME-BASED 30-SECOND EPOCHING\n');
+epoch_edges = 0:epoch_sec:floor(t(end)/epoch_sec)*epoch_sec;
+num_epochs = numel(epoch_edges) - 1;
+fprintf('Epoch length                : %d s\n', epoch_sec);
+fprintf('Total epochs                : %d\n', num_epochs);
+Epoch                = (1:num_epochs)';
+StartTime_s          = epoch_edges(1:end-1)';
+EndTime_s            = epoch_edges(2:end)';
+RMS_kPa              = nan(num_epochs,1);
+LocalRange_kPa       = nan(num_epochs,1);
+EnvelopeMean_kPa     = nan(num_epochs,1);
+EnvelopeCV           = nan(num_epochs,1);
+EnvelopeP10_kPa      = nan(num_epochs,1);
+EnvelopeP90_kPa      = nan(num_epochs,1);
+NumBreaths           = nan(num_epochs,1);
+MeanBreathInterval_s = nan(num_epochs,1);
+RespiratoryRate_bpm  = nan(num_epochs,1);
+LocalProminence_kPa  = nan(num_epochs,1);
+ZeroCrossingRate     = nan(num_epochs,1);
+HasApneaEvent        = false(num_epochs,1);
+NumApneaEvents       = zeros(num_epochs,1);
+ApneaOverlap_s       = zeros(num_epochs,1);
+%% ------------------------------------------------------------
+% GLOBAL NORMALIZATION REFERENCES
+%% ------------------------------------------------------------
+globalRMS = rms(x_filt);
+globalRange = prctile(x_env,95) - prctile(x_env,5);
+globalEnvMean = mean(x_env,'omitnan');
+if globalRMS < eps, globalRMS = eps; end
+if globalRange < eps, globalRange = eps; end
+if globalEnvMean < eps, globalEnvMean = eps; end
+%% ------------------------------------------------------------
+% EPOCH FEATURE EXTRACTION
+%% ------------------------------------------------------------
+fprintf('\n[STEP 5] EPOCH FEATURE EXTRACTION\n');
+for e = 1:num_epochs
+   t0 = StartTime_s(e);
+   t1 = EndTime_s(e);
+   idx = (t >= t0) & (t < t1);
+   if ~any(idx)
+       continue;
+   end
+   te = t(idx);
+   xe = x_filt(idx);
+   enve = x_env(idx);
+   if numel(xe) < 5
+       continue;
+   end
+   RMS_kPa(e)          = rms(xe);
+   LocalRange_kPa(e)   = max(enve) - min(enve);
+   EnvelopeMean_kPa(e) = mean(enve, 'omitnan');
+   EnvelopeCV(e)       = std(enve, 'omitnan') / max(mean(enve, 'omitnan'), eps);
+   EnvelopeP10_kPa(e)  = prctile(enve, 10);
+   EnvelopeP90_kPa(e)  = prctile(enve, 90);
+   % Breath detection
+   min_peak_distance_samples = max(1, round(min_peak_distance_sec * Fs));
+   prominence_guess = max(std(xe, 'omitnan') * 0.2, eps);
+   try
+       [~, locs] = findpeaks(xe, ...
+           'MinPeakDistance', min_peak_distance_samples, ...
+           'MinPeakProminence', prominence_guess);
+       NumBreaths(e) = numel(locs);
+       if numel(locs) >= 2
+           bt = te(locs);
+           ibi = diff(bt);
+           MeanBreathInterval_s(e) = mean(ibi, 'omitnan');
+           RespiratoryRate_bpm(e)  = 60 / max(MeanBreathInterval_s(e), eps);
+       elseif numel(locs) == 1
+           MeanBreathInterval_s(e) = NaN;
+           RespiratoryRate_bpm(e)  = NaN;
+       else
+           MeanBreathInterval_s(e) = NaN;
+           RespiratoryRate_bpm(e)  = 0;
+       end
+   catch
+       NumBreaths(e) = NaN;
+       MeanBreathInterval_s(e) = NaN;
+       RespiratoryRate_bpm(e) = NaN;
+   end
+   % Local prominence proxy
+   LocalProminence_kPa(e) = max(enve) - median(enve, 'omitnan');
+   % Zero crossing rate
+   sgn = sign(xe);
+   sgn(sgn == 0) = 1;
+   ZeroCrossingRate(e) = sum(abs(diff(sgn)) > 0) / max(numel(xe)-1,1);
+   % Overlap with apnea events
+   overlap_total = 0;
+   overlap_count = 0;
+   for k = 1:numApneaEventsTotal
+       ov = max(0, min(t1, eventEnd_s(k)) - max(t0, eventStart_s(k)));
+       if ov > 0
+           overlap_total = overlap_total + ov;
+           overlap_count = overlap_count + 1;
+       end
+   end
+   ApneaOverlap_s(e) = overlap_total;
+   NumApneaEvents(e) = overlap_count;
+   HasApneaEvent(e)  = overlap_total >= TH_APNEA_OVERLAP_SEC || overlap_count > 0;
+end
+%% ------------------------------------------------------------
+% NORMALIZATION
+%% ------------------------------------------------------------
+RMS_norm          = RMS_kPa ./ globalRMS;
+LocalRange_norm   = LocalRange_kPa ./ globalRange;
+EnvelopeMean_norm = EnvelopeMean_kPa ./ globalEnvMean;
+%% ------------------------------------------------------------
+% LOCKED CLASSIFICATION
+%% ------------------------------------------------------------
+fprintf('\n[STEP 6] LOCKED EPOCH CLASSIFICATION\n');
+Class      = strings(num_epochs,1);
+Reason     = strings(num_epochs,1);
+FinalClass = strings(num_epochs,1);
+for e = 1:num_epochs
+   badEpoch = isnan(RMS_norm(e)) || isnan(LocalRange_norm(e)) || isnan(EnvelopeMean_norm(e));
+   if badEpoch
+       Class(e)      = "LowQuality";
+       FinalClass(e) = "LowQuality";
+       Reason(e)     = "Insufficient samples/features in epoch";
+       continue;
+   end
+   lowAmp   = RMS_norm(e) < TH_RMS_NORM_APNEA;
+   lowRange = LocalRange_norm(e) < TH_LR_NORM_APNEA;
+   hasApnea = HasApneaEvent(e) || ApneaOverlap_s(e) >= TH_APNEA_OVERLAP_SEC;
+   % Final locked rule from best corrected threshold sweep:
+   % RuleA_AND = low RMS_norm AND low LocalRange_norm
+   if hasApnea && lowAmp && lowRange
+       Class(e)      = "ApneaLike";
+       FinalClass(e) = "ApneaLike";
+       Reason(e)     = "Strict apnea overlap with low RMS_norm and low LocalRange_norm (locked RuleA_AND)";
+   elseif lowAmp && lowRange
+       Class(e)      = "FlowReduced";
+       FinalClass(e) = "FlowReduced";
+       Reason(e)     = "Reduced normalized airflow amplitude and local range (locked RuleA_AND base pattern)";
+   else
+       Class(e)      = "Normal";
+       FinalClass(e) = "Normal";
+       Reason(e)     = "Normalized airflow amplitude and variability preserved";
+   end
+end
+%% ------------------------------------------------------------
+% BUILD FINAL TABLE
+%% ------------------------------------------------------------
+EpochTable = table;
+EpochTable.Epoch                = Epoch;
+EpochTable.StartTime_s          = StartTime_s;
+EpochTable.EndTime_s            = EndTime_s;
+EpochTable.RMS_kPa              = RMS_kPa;
+EpochTable.LocalRange_kPa       = LocalRange_kPa;
+EpochTable.EnvelopeMean_kPa     = EnvelopeMean_kPa;
+EpochTable.EnvelopeCV           = EnvelopeCV;
+EpochTable.EnvelopeP10_kPa      = EnvelopeP10_kPa;
+EpochTable.EnvelopeP90_kPa      = EnvelopeP90_kPa;
+EpochTable.RMS_norm             = RMS_norm;
+EpochTable.LocalRange_norm      = LocalRange_norm;
+EpochTable.EnvelopeMean_norm    = EnvelopeMean_norm;
+EpochTable.NumBreaths           = NumBreaths;
+EpochTable.MeanBreathInterval_s = MeanBreathInterval_s;
+EpochTable.RespiratoryRate_bpm  = RespiratoryRate_bpm;
+EpochTable.LocalProminence_kPa  = LocalProminence_kPa;
+EpochTable.ZeroCrossingRate     = ZeroCrossingRate;
+EpochTable.Class                = Class;
+EpochTable.Reason               = Reason;
+EpochTable.HasApneaEvent        = HasApneaEvent;
+EpochTable.NumApneaEvents       = NumApneaEvents;
+EpochTable.ApneaOverlap_s       = ApneaOverlap_s;
+EpochTable.FinalClass           = FinalClass;
+%% ------------------------------------------------------------
+% SIGNAL TRACE OUTPUT
+%% ------------------------------------------------------------
+SignalTrace = table;
+SignalTrace.Time_s          = t;
+SignalTrace.AirflowRaw      = x;
+SignalTrace.AirflowFiltered = x_filt;
+SignalTrace.Envelope        = x_env;
+SignalTrace.LocalBaseline   = local_baseline;
+SignalTrace.ApneaMask       = apnea_mask;
+%% ------------------------------------------------------------
+% SUMMARY
+%% ------------------------------------------------------------
+numNormal    = sum(FinalClass == "Normal");
+numReduced   = sum(FinalClass == "FlowReduced");
+numApneaLike = sum(FinalClass == "ApneaLike");
+numLowQ      = sum(FinalClass == "LowQuality");
+fprintf('\n================ AIRFLOW SUMMARY ================\n');
+fprintf('Total epochs                : %d\n', num_epochs);
+fprintf('Normal epochs               : %d\n', numNormal);
+fprintf('FlowReduced epochs          : %d\n', numReduced);
+fprintf('ApneaLike epochs            : %d\n', numApneaLike);
+fprintf('LowQuality epochs           : %d\n', numLowQ);
+fprintf('Detected apnea-like events  : %d\n', numApneaEventsTotal);
+fprintf('Locked RMS_norm threshold   : %.5f\n', TH_RMS_NORM_APNEA);
+fprintf('Locked LR_norm threshold    : %.5f\n', TH_LR_NORM_APNEA);
+fprintf('=================================================\n');
+%% ------------------------------------------------------------
+% SAVE OUTPUTS
+%% ------------------------------------------------------------
+if ~exist(outDir, 'dir')
+   mkdir(outDir);
+end
+epochFile = fullfile(outDir, 'airflow_epoch_final_classification.csv');
+eventFile = fullfile(outDir, 'airflow_apnea_events.csv');
+traceFile = fullfile(outDir, 'airflow_signal_trace.csv');
+writetable(EpochTable, epochFile);
+writetable(ApneaEvents, eventFile);
+writetable(SignalTrace, traceFile);
+fprintf('\nSaved files:\n');
+fprintf(' - %s\n', epochFile);
+fprintf(' - %s\n', eventFile);
+fprintf(' - %s\n', traceFile);
+fprintf('\nDone.\n');
+
