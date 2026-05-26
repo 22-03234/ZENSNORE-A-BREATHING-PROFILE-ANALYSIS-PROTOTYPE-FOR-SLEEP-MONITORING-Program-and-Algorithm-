@@ -1,0 +1,177 @@
+Storage Utilization and Capacity Estimation Script
+
+# ==============================================================
+# ZENSNORE STORAGE ANALYSIS (REVISED FINAL)
+#
+# Computes:
+# 1. Average size per minute of each generated file type
+# 2. Total storage generation rate
+# 3. Estimated duration capacity using 8 GB SD card
+#
+# Outputs:
+# Storage_Analysis.xlsx
+# ==============================================================
+
+
+import os
+import pandas as pd
+import numpy as np
+
+
+NUM_SUBJECTS = 10
+CAPACITY_GB = 8
+
+
+records = []
+
+
+# ==============================================================
+# FILE TYPES
+# ==============================================================
+
+
+file_types = {
+    "Airflow sensor data": "airflow.csv",
+    "PPG sensor data": "ppg.csv",
+    "Audio frequency features": "audio_freq.csv",
+    "Raw audio recording": "audio.wav",
+    "Audio metadata": "run_metadata.json"
+}
+
+
+# ==============================================================
+# MAIN LOOP
+# ==============================================================
+
+
+for s in range(1, NUM_SUBJECTS + 1):
+
+
+    airflow_file = f"S{s}_airflow.csv"
+
+
+    if not os.path.exists(airflow_file):
+        continue
+
+
+    try:
+        df = pd.read_csv(airflow_file)
+
+
+        t = pd.to_numeric(df["t_ns"], errors="coerce").dropna() / 1e9
+
+
+        if len(t) < 2:
+            continue
+
+
+        duration_min = (t.iloc[-1] - t.iloc[0]) / 60
+
+
+    except:
+        continue
+
+
+    for label, suffix in file_types.items():
+
+
+        fname = f"S{s}_{suffix}"
+
+
+        if os.path.exists(fname):
+
+
+            size_bytes = os.path.getsize(fname)
+            size_mb = size_bytes / (1024**2)
+
+
+            mb_per_min = size_mb / duration_min if duration_min > 0 else np.nan
+
+
+            records.append([
+                s,
+                label,
+                fname,
+                size_mb,
+                mb_per_min
+            ])
+
+
+# ==============================================================
+# DATAFRAME
+# ==============================================================
+
+
+df = pd.DataFrame(records, columns=[
+    "Subject",
+    "Data Type",
+    "Filename",
+    "FileSize_MB",
+    "MB_per_min"
+])
+
+
+# ==============================================================
+# TABLE 1
+# Average Size per Minute
+# ==============================================================
+
+
+summary = df.groupby("Data Type")["MB_per_min"].mean().reset_index()
+
+
+summary.columns = [
+    "Data Type",
+    "Average Size per Minute (MB/min)"
+]
+
+
+total_rate = summary["Average Size per Minute (MB/min)"].sum()
+
+
+summary.loc[len(summary)] = [
+    "Total Storage Rate",
+    total_rate
+]
+
+
+# ==============================================================
+# TABLE 2
+# Capacity Summary
+# ==============================================================
+
+
+capacity_mb = CAPACITY_GB * 1024
+
+
+estimated_minutes = capacity_mb / total_rate
+estimated_hours = estimated_minutes / 60
+
+
+capacity_table = pd.DataFrame({
+    "Storage Capacity (GB)": [CAPACITY_GB],
+    "Estimated Duration Capacity (hours)": [estimated_hours],
+    "Data Generation Rate (MB/min)": [total_rate]
+})
+
+
+# ==============================================================
+# EXPORT
+# ==============================================================
+
+
+with pd.ExcelWriter("Storage_Analysis.xlsx") as writer:
+
+
+    df.to_excel(writer, sheet_name="Raw_File_Data", index=False)
+
+
+    summary.to_excel(writer, sheet_name="Average_MB_per_Min", index=False)
+
+
+    capacity_table.to_excel(writer, sheet_name="Capacity_Summary", index=False)
+
+
+print("DONE")
+print("Generated: Storage_Analysis.xlsx")
+
