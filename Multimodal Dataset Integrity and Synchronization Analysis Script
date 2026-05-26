@@ -1,0 +1,306 @@
+Multimodal Dataset Integrity and Synchronization Analysis Script
+
+# ==============================================================
+# ZENSNORE OBJECTIVE 2 (REVISED THESIS VERSION)
+# HYBRID AUDIO ANALYSIS
+#
+# Airflow  : CSV timestamps + integrity
+# PPG      : CSV timestamps + integrity
+# Audio    : audio_freq.csv for synchronization
+#            audio.wav      for integrity/sample count
+#
+# Outputs:
+# Subject_Level_Results.xlsx
+# Mean_SD_Summary.xlsx
+# ==============================================================
+
+
+import pandas as pd
+import numpy as np
+from scipy.io import wavfile
+import os
+
+
+NUM_SUBJECTS = 10
+
+
+TARGET_FS = {
+    "Airflow": 100,
+    "PPG": 100,
+    "Audio": 8000
+}
+
+
+results = []
+
+
+# ==============================================================
+# GENERIC CSV ANALYSIS
+# ==============================================================
+
+
+def analyze_csv(subject, sensor_name, file_path, required_cols):
+
+
+    df = pd.read_csv(file_path)
+
+
+    time = pd.to_numeric(df["t_ns"], errors="coerce") / 1e9
+    time = time.dropna().reset_index(drop=True)
+
+
+    if len(time) < 2:
+        return None
+
+
+    dt = np.diff(time)
+
+
+    min_dt = np.min(dt)
+    max_dt = np.max(dt)
+    avg_dt = np.mean(dt)
+    sd_dt  = np.std(dt)
+
+
+    start_time = time.iloc[0]
+    end_time   = time.iloc[-1]
+
+
+    duration_sec = end_time - start_time
+    duration_hr  = duration_sec / 3600
+
+
+    est_fs = TARGET_FS[sensor_name]
+    actual_fs = len(time) / duration_sec if duration_sec > 0 else 0
+
+
+    expected_samples = round(duration_sec * est_fs)
+    actual_samples = len(df)
+
+
+    missing_samples = max(expected_samples - actual_samples, 0)
+
+
+    corrupted = df[required_cols].isna().any(axis=1).sum()
+
+
+    loss_percent = ((missing_samples + corrupted) / expected_samples) * 100 if expected_samples > 0 else 0
+    sampling_error_percent = abs(actual_fs - est_fs) / est_fs * 100
+
+
+    return [
+        subject, sensor_name,
+        min_dt, max_dt, avg_dt, sd_dt,
+        est_fs, actual_fs,
+        duration_hr,
+        expected_samples,
+        actual_samples,
+        missing_samples,
+        corrupted,
+        loss_percent,
+        sampling_error_percent,
+        start_time,
+        end_time,
+        duration_sec
+    ]
+
+
+
+
+# ==============================================================
+# AUDIO HYBRID ANALYSIS
+# audio_freq.csv = timing
+# audio.wav      = integrity
+# ==============================================================
+
+
+def analyze_audio(subject, freq_csv, wav_file):
+
+
+    # ---------- timing from audio_freq.csv ----------
+    df = pd.read_csv(freq_csv)
+
+
+    time = pd.to_numeric(df["t_ns"], errors="coerce") / 1e9
+    time = time.dropna().reset_index(drop=True)
+
+
+    if len(time) < 2:
+        return None
+
+
+    dt = np.diff(time)
+
+
+    min_dt = np.min(dt)
+    max_dt = np.max(dt)
+    avg_dt = np.mean(dt)
+    sd_dt  = np.std(dt)
+
+
+    start_time = time.iloc[0]
+    end_time   = time.iloc[-1]
+
+
+    # ---------- integrity from WAV ----------
+    Fs, audio = wavfile.read(wav_file)
+
+
+    actual_samples = len(audio)
+    duration_sec = actual_samples / Fs
+    duration_hr  = duration_sec / 3600
+
+
+    est_fs = TARGET_FS["Audio"]
+    actual_fs = Fs
+
+
+    expected_samples = round(duration_sec * est_fs)
+    missing_samples = max(expected_samples - actual_samples, 0)
+
+
+    corrupted = 0
+
+
+    loss_percent = ((missing_samples + corrupted) / expected_samples) * 100 if expected_samples > 0 else 0
+    sampling_error_percent = abs(actual_fs - est_fs) / est_fs * 100
+
+
+    return [
+        subject, "Audio",
+        min_dt, max_dt, avg_dt, sd_dt,
+        est_fs, actual_fs,
+        duration_hr,
+        expected_samples,
+        actual_samples,
+        missing_samples,
+        corrupted,
+        loss_percent,
+        sampling_error_percent,
+        start_time,
+        end_time,
+        duration_sec
+    ]
+
+
+
+
+# ==============================================================
+# MAIN LOOP
+# ==============================================================
+
+
+for s in range(1, NUM_SUBJECTS + 1):
+
+
+    # Airflow
+    file = f"S{s}_airflow.csv"
+    if os.path.exists(file):
+        row = analyze_csv(
+            s, "Airflow", file,
+            ["t_ns", "pressure_kpa_zeroed"]
+        )
+        if row:
+            results.append(row)
+
+
+    # PPG
+    file = f"S{s}_ppg.csv"
+    if os.path.exists(file):
+        row = analyze_csv(
+            s, "PPG", file,
+            ["t_ns", "RED", "IR"]
+        )
+        if row:
+            results.append(row)
+
+
+    # Audio
+    freq_file = f"S{s}_audio_freq.csv"
+    wav_file  = f"S{s}_audio.wav"
+
+
+    if os.path.exists(freq_file) and os.path.exists(wav_file):
+        row = analyze_audio(s, freq_file, wav_file)
+        if row:
+            results.append(row)
+
+
+# ==============================================================
+# DATAFRAME
+# ==============================================================
+
+
+columns = [
+    "Subject","Sensor",
+    "Min_dt","Max_dt","Avg_dt","SD_dt",
+    "Target_fs","Actual_fs",
+    "Duration_hr",
+    "ExpectedSamples",
+    "ActualSamples",
+    "MissingSamples",
+    "CorruptedEntries",
+    "LossPercent",
+    "SamplingRateDeviationPercent",
+    "StartTime",
+    "EndTime",
+    "Duration_sec"
+]
+
+
+df = pd.DataFrame(results, columns=columns)
+
+
+# ==============================================================
+# START OFFSET / END OFFSET / DRIFT
+# ==============================================================
+
+
+sync_rows = []
+
+
+for subj in df["Subject"].unique():
+
+
+    temp = df[df["Subject"] == subj]
+
+
+    if len(temp) == 3:
+
+
+        start_offset = temp["StartTime"].max() - temp["StartTime"].min()
+        end_offset   = temp["EndTime"].max() - temp["EndTime"].min()
+        drift        = temp["Duration_sec"].max() - temp["Duration_sec"].min()
+
+
+        sync_rows.append([subj, start_offset, end_offset, drift])
+
+
+sync_df = pd.DataFrame(sync_rows, columns=[
+    "Subject",
+    "StartOffset_sec",
+    "EndOffset_sec",
+    "Drift_sec"
+])
+
+
+df = df.merge(sync_df, on="Subject", how="left")
+
+
+# ==============================================================
+# EXPORT
+# ==============================================================
+
+
+df.to_excel("Subject_Level_Results.xlsx", index=False)
+
+
+summary = df.groupby("Sensor").agg(["mean","std"])
+summary.to_excel("Mean_SD_Summary.xlsx")
+
+
+print("DONE")
+print("Generated:")
+print("1. Subject_Level_Results.xlsx")
+print("2. Mean_SD_Summary.xlsx")
+
