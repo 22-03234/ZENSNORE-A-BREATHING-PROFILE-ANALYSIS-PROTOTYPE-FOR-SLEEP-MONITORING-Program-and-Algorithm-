@@ -1,0 +1,458 @@
+%% ============================================================
+%  ZENSNORE MASTER SpO2 PIPELINE
+%  FINAL LOCKED CONSTRAINED-ADAPTIVE VERSION
+%
+%  - Locked after training-phase refinement
+%  - PI quality gate derived only from 7 training datasets
+%  - Locked clinical desaturation thresholds
+% ============================================================
+clc;
+clear;
+close all;
+fprintf('\n============================================================\n');
+fprintf(' ZENSNORE MASTER SpO2 PIPELINE (FINAL LOCKED CONSTRAINED-ADAPTIVE)\n');
+fprintf('============================================================\n');
+%% =========================
+% USER SETTINGS
+%% =========================
+inputFile    = 'ppg.csv';
+outputFolder = fullfile(pwd, 'spo2_outputs');
+% Locked final settings
+epochLen_sec             = 30;
+baselineWindow_sec       = 120;
+desatDrop_thr            = 3.0;
+desatMinDur_sec          = 10;
+meanSpO2_abnormal_thr    = 90.0;
+meanSpO2_support_thr     = 92.0;
+borderlineDrop_low       = 2.0;
+borderlineDrop_high      = 3.0;
+shortDrop_thr            = 3.0;
+spo2_artifactRate_thr    = 4.0;
+spo2_min_valid           = 70;
+spo2_max_valid           = 100;
+% FINAL TRAINING-DERIVED LOCKED PI RULE
+pi_floor_locked          = 0.0008;
+pi_percentile_locked     = 20;
+pi_cap_locked            = 0.0015;
+minEpochValidFrac        = 0.20;
+recoveryRise_thr         = 2.0;
+highVar_thr_default      = 1.0;
+minSamplesForAdaptiveVar = 30;
+fprintf('Current working directory:\n%s\n', pwd);
+fprintf('Requested output folder:\n%s\n', outputFolder);
+if ~exist(outputFolder, 'dir')
+   mkdir(outputFolder);
+end
+%% =========================
+% LOAD FILE
+%% =========================
+if ~isfile(inputFile)
+   error('Unable to find input file: %s', fullfile(pwd, inputFile));
+end
+T = readtable(inputFile);
+requiredCols = {'t_ns','RED','IR'};
+for i = 1:numel(requiredCols)
+   if ~ismember(requiredCols{i}, T.Properties.VariableNames)
+       error('Missing required column "%s" in ppg.csv', requiredCols{i});
+   end
+end
+t_ns = double(T.t_ns);
+RED  = double(T.RED);
+IR   = double(T.IR);
+valid0 = isfinite(t_ns) & isfinite(RED) & isfinite(IR);
+t_ns = t_ns(valid0);
+RED  = RED(valid0);
+IR   = IR(valid0);
+if numel(t_ns) < 100
+   error('Not enough valid samples in ppg.csv');
+end
+t_sec = (t_ns - t_ns(1)) / 1e9;
+dt = median(diff(t_sec));
+fs = 1 / dt;
+duration_sec = t_sec(end) - t_sec(1);
+fprintf('\nInput file                              : %s\n', inputFile);
+fprintf('Estimated sampling rate                 : %.2f Hz\n', fs);
+fprintf('Recording duration                      : %.2f min\n', duration_sec/60);
+%% =========================
+% STAGE 1: RAW PPG -> R -> SpO2
+%% =========================
+winSec  = 4;
+stepSec = 1;
+winN  = max(round(winSec * fs), 1);
+stepN = max(round(stepSec * fs), 1);
+n = numel(t_sec);
+startIdx = 1:stepN:(n - winN + 1);
+numWins  = numel(startIdx);
+t_win   = nan(numWins,1);
+red_dc  = nan(numWins,1);
+ir_dc   = nan(numWins,1);
+red_ac  = nan(numWins,1);
+ir_ac   = nan(numWins,1);
+R       = nan(numWins,1);
+PI      = nan(numWins,1);
+SpO2raw = nan(numWins,1);
+for k = 1:numWins
+   idx = startIdx(k):(startIdx(k)+winN-1);
+   redSeg = RED(idx);
+   irSeg  = IR(idx);
+   tSeg   = t_sec(idx);
+   red_dc(k) = mean(redSeg, 'omitnan');
+   ir_dc(k)  = mean(irSeg,  'omitnan');
+   red_ac(k) = rms(redSeg - red_dc(k), 'omitnan');
+   ir_ac(k)  = rms(irSeg  - ir_dc(k),  'omitnan');
+   t_win(k) = mean(tSeg, 'omitnan');
+   if isfinite(red_dc(k)) && isfinite(ir_dc(k)) && red_dc(k) > 0 && ir_dc(k) > 0 ...
+           && isfinite(red_ac(k)) && isfinite(ir_ac(k))
+       R(k)  = (red_ac(k)/red_dc(k)) / (ir_ac(k)/ir_dc(k));
+       PI(k) = ir_ac(k) / ir_dc(k);
+   end
+   if isfinite(R(k))
+       SpO2raw(k) = 110 - 25*R(k);
+   end
+end
+% =========================================================
+% FINAL TRAINING-DERIVED LOCKED CONSTRAINED-ADAPTIVE PI GATE
+% Derived only from the 7 training datasets
+% =========================================================
+validPI = PI(isfinite(PI) & PI > 0);
+if isempty(validPI)
+   pi_low_thr = pi_floor_locked;
+else
+   pi_low_thr = prctile(validPI, pi_percentile_locked);
+   pi_low_thr = max(pi_low_thr, pi_floor_locked);
+   pi_low_thr = min(pi_low_thr, pi_cap_locked);
+end
+valid1 = isfinite(R) & isfinite(PI) & isfinite(SpO2raw) ...
+      & PI >= pi_low_thr ...
+      & R > 0 & R < 4 ...
+      & SpO2raw >= spo2_min_valid & SpO2raw <= spo2_max_valid;
+t_q    = t_win(valid1);
+R_q    = R(valid1);
+PI_q   = PI(valid1);
+SpO2_q = SpO2raw(valid1);
+artifactMask = false(size(SpO2_q));
+if numel(SpO2_q) >= 2
+   dtq = diff(t_q);
+   dspo2 = abs(diff(SpO2_q));
+   rate = dspo2 ./ max(dtq, eps);
+   artifactMask(2:end) = rate > spo2_artifactRate_thr;
+end
+t_clean    = t_q(~artifactMask);
+R_clean    = R_q(~artifactMask);
+PI_clean   = PI_q(~artifactMask);
+SpO2_clean = SpO2_q(~artifactMask);
+recomputedTbl = table(t_win, red_dc, ir_dc, red_ac, ir_ac, PI, R, SpO2raw, ...
+   'VariableNames', {'Time_sec','RED_DC','IR_DC','RED_AC_RMS','IR_AC_RMS','PI','R','SpO2_raw'});
+writetable(recomputedTbl, fullfile(outputFolder,'spo2_recomputed_from_raw.csv'));
+fprintf('Saved: %s\n', fullfile(outputFolder,'spo2_recomputed_from_raw.csv'));
+artifactTbl = table(t_clean, R_clean, PI_clean, SpO2_clean, ...
+   'VariableNames', {'Time_sec','R','PI','SpO2_clean'});
+writetable(artifactTbl, fullfile(outputFolder,'spo2_final_artifact_rejected.csv'));
+fprintf('Saved: %s\n', fullfile(outputFolder,'spo2_final_artifact_rejected.csv'));
+fprintf('\n[STAGE 1] RAW PPG / R / SpO2\n');
+fprintf('Total raw samples                       : %d\n', numel(t_sec));
+fprintf('Windowed R values                       : %d\n', numWins);
+fprintf('Locked constrained adaptive PI threshold: %.6f\n', pi_low_thr);
+fprintf('Remaining after quality + R filtering   : %d\n', numel(t_q));
+fprintf('Artifacts removed                       : %d\n', sum(artifactMask));
+fprintf('Final continuous SpO2 samples           : %d\n', numel(SpO2_clean));
+if ~isempty(SpO2_clean)
+   fprintf('Final SpO2 min / max / mean             : %.2f / %.2f / %.2f %%\n', ...
+       min(SpO2_clean), max(SpO2_clean), mean(SpO2_clean));
+else
+   fprintf('Final SpO2 min / max / mean             : N/A\n');
+end
+%% =========================
+% STAGE 2: 1-HZ RESAMPLING + DESATURATION EVENTS
+%% =========================
+t_1hz = (0:floor(duration_sec))';
+if isempty(t_clean)
+   SpO2_1hz = nan(size(t_1hz));
+else
+   SpO2_1hz = interp1(t_clean, SpO2_clean, t_1hz, 'linear', nan);
+   nanMask = isnan(SpO2_1hz);
+   if any(~nanMask)
+       gapStarts = find(diff([0; nanMask; 0]) == 1);
+       gapEnds   = find(diff([0; nanMask; 0]) == -1) - 1;
+       for g = 1:numel(gapStarts)
+           gs = gapStarts(g);
+           ge = gapEnds(g);
+           gapLen = ge - gs + 1;
+           if gapLen <= 10 && gs > 1 && ge < numel(SpO2_1hz) ...
+                   && ~isnan(SpO2_1hz(gs-1)) && ~isnan(SpO2_1hz(ge+1))
+               SpO2_1hz(gs:ge) = linspace(SpO2_1hz(gs-1), SpO2_1hz(ge+1), gapLen);
+           end
+       end
+   end
+end
+baseline_1hz = nan(size(SpO2_1hz));
+for i = 1:numel(t_1hz)
+   t0 = max(0, t_1hz(i) - baselineWindow_sec);
+   idx = t_1hz >= t0 & t_1hz < t_1hz(i);
+   vals = SpO2_1hz(idx);
+   vals = vals(isfinite(vals));
+   if numel(vals) >= 10
+       baseline_1hz(i) = median(vals);
+   end
+end
+dropMag_1hz = baseline_1hz - SpO2_1hz;
+eventMask = isfinite(dropMag_1hz) & dropMag_1hz >= desatDrop_thr & isfinite(SpO2_1hz);
+eventStarts = find(diff([0; eventMask; 0]) == 1);
+eventEnds   = find(diff([0; eventMask; 0]) == -1) - 1;
+evtStart_sec = [];
+evtEnd_sec   = [];
+evtDur_sec   = [];
+evtMinSpO2   = [];
+evtBase      = [];
+evtDrop      = [];
+for e = 1:numel(eventStarts)
+   s = eventStarts(e);
+   en = eventEnds(e);
+   dur = en - s + 1;
+   if dur >= desatMinDur_sec
+       segSpO2 = SpO2_1hz(s:en);
+       segBase = baseline_1hz(s:en);
+       evtStart_sec(end+1,1) = t_1hz(s); %#ok<SAGROW>
+       evtEnd_sec(end+1,1)   = t_1hz(en); %#ok<SAGROW>
+       evtDur_sec(end+1,1)   = dur; %#ok<SAGROW>
+       evtMinSpO2(end+1,1)   = min(segSpO2, [], 'omitnan'); %#ok<SAGROW>
+       evtBase(end+1,1)      = mean(segBase, 'omitnan'); %#ok<SAGROW>
+       evtDrop(end+1,1)      = max(segBase - segSpO2, [], 'omitnan'); %#ok<SAGROW>
+   end
+end
+eventsTbl = table(evtStart_sec, evtEnd_sec, evtDur_sec, evtBase, evtMinSpO2, evtDrop, ...
+   'VariableNames', {'Start_sec','End_sec','Duration_sec','BaselineSpO2','MinSpO2','MaxDropFromBaseline'});
+writetable(eventsTbl, fullfile(outputFolder,'spo2_desaturation_events.csv'));
+fprintf('Saved: %s\n', fullfile(outputFolder,'spo2_desaturation_events.csv'));
+fprintf('\n[STAGE 2] LOCKED EVENT DETECTION\n');
+fprintf('1 Hz resampled SpO2 samples             : %d\n', numel(t_1hz));
+fprintf('Baseline window                         : %d sec\n', baselineWindow_sec);
+fprintf('Locked drop threshold                   : %.1f %%\n', desatDrop_thr);
+fprintf('Locked min event duration               : %d sec\n', desatMinDur_sec);
+fprintf('Detected desaturation events            : %d\n', height(eventsTbl));
+if height(eventsTbl) > 0
+   fprintf('Lowest event SpO2                       : %.2f %%\n', min(eventsTbl.MinSpO2));
+   fprintf('Largest drop from baseline              : %.2f %%\n', max(eventsTbl.MaxDropFromBaseline));
+else
+   fprintf('Lowest event SpO2                       : N/A\n');
+   fprintf('Largest drop from baseline              : N/A\n');
+end
+%% =========================
+% STAGE 3: EPOCH FEATURES
+%% =========================
+numEpochs = floor(duration_sec / epochLen_sec);
+EpochNumber        = (1:numEpochs)';
+EpochStart_sec     = (EpochNumber-1) * epochLen_sec;
+EpochEnd_sec       = EpochStart_sec + epochLen_sec;
+MeanSpO2           = nan(numEpochs,1);
+MinSpO2            = nan(numEpochs,1);
+MaxSpO2            = nan(numEpochs,1);
+SpO2Std            = nan(numEpochs,1);
+ValidSamples       = zeros(numEpochs,1);
+ValidFraction      = zeros(numEpochs,1);
+BaselineMean       = nan(numEpochs,1);
+DropMagnitude      = nan(numEpochs,1);
+HasDesaturation    = false(numEpochs,1);
+DesatDuration_sec  = zeros(numEpochs,1);
+HasBorderlineDrop        = false(numEpochs,1);
+HasShortDropOver3        = false(numEpochs,1);
+HasHighVariability       = false(numEpochs,1);
+HasLowOxygenReserve      = false(numEpochs,1);
+HasHighInstabilityBurden = false(numEpochs,1);
+HasRecoveryLikeBehavior  = false(numEpochs,1);
+HasStrongSupportiveInstability = false(numEpochs,1);
+PoorSignal               = false(numEpochs,1);
+borderlineMask = isfinite(dropMag_1hz) & dropMag_1hz >= borderlineDrop_low & dropMag_1hz < borderlineDrop_high;
+shortDropMask  = isfinite(dropMag_1hz) & dropMag_1hz >= shortDrop_thr;
+shortDropStarts = find(diff([0; shortDropMask; 0]) == 1);
+shortDropEnds   = find(diff([0; shortDropMask; 0]) == -1) - 1;
+shortDropMaskFinal = false(size(shortDropMask));
+for e = 1:numel(shortDropStarts)
+   s = shortDropStarts(e);
+   en = shortDropEnds(e);
+   dur = en - s + 1;
+   if dur < desatMinDur_sec
+       shortDropMaskFinal(s:en) = true;
+   end
+end
+allStdCandidates = [];
+for ep = 1:numEpochs
+   idx = t_1hz >= EpochStart_sec(ep) & t_1hz < EpochEnd_sec(ep);
+   vals = SpO2_1hz(idx);
+   vals = vals(isfinite(vals));
+   if numel(vals) >= 5
+       allStdCandidates(end+1,1) = std(vals, 'omitnan'); %#ok<SAGROW>
+   end
+end
+if numel(allStdCandidates) >= minSamplesForAdaptiveVar
+   highVar_thr = max(highVar_thr_default, prctile(allStdCandidates, 75));
+else
+   highVar_thr = highVar_thr_default;
+end
+for ep = 1:numEpochs
+   s = EpochStart_sec(ep);
+   en = EpochEnd_sec(ep);
+   idx = t_1hz >= s & t_1hz < en;
+   vals = SpO2_1hz(idx);
+   baseVals = baseline_1hz(idx);
+   dropVals = dropMag_1hz(idx);
+   validVals = vals(isfinite(vals));
+   ValidSamples(ep)  = sum(isfinite(vals));
+   ValidFraction(ep) = ValidSamples(ep) / epochLen_sec;
+   if ~isempty(validVals)
+       MeanSpO2(ep) = mean(validVals, 'omitnan');
+       MinSpO2(ep)  = min(validVals, [], 'omitnan');
+       MaxSpO2(ep)  = max(validVals, [], 'omitnan');
+       SpO2Std(ep)  = std(validVals, 'omitnan');
+   end
+   baseFinite = baseVals(isfinite(baseVals));
+   if ~isempty(baseFinite)
+       BaselineMean(ep) = mean(baseFinite, 'omitnan');
+   end
+   dropFinite = dropVals(isfinite(dropVals));
+   if ~isempty(dropFinite)
+       DropMagnitude(ep) = max(dropFinite, [], 'omitnan');
+   end
+   overlapDur = 0;
+   for ev = 1:height(eventsTbl)
+       ov = max(0, min(en, eventsTbl.End_sec(ev)+1) - max(s, eventsTbl.Start_sec(ev)));
+       overlapDur = overlapDur + ov;
+   end
+   DesatDuration_sec(ep) = overlapDur;
+   HasDesaturation(ep) = overlapDur > 0;
+   HasBorderlineDrop(ep) = any(borderlineMask(idx));
+   HasShortDropOver3(ep) = any(shortDropMaskFinal(idx));
+   HasHighVariability(ep) = isfinite(SpO2Std(ep)) && SpO2Std(ep) >= highVar_thr;
+   HasLowOxygenReserve(ep) = isfinite(MeanSpO2(ep)) && MeanSpO2(ep) <= meanSpO2_support_thr;
+   HasHighInstabilityBurden(ep) = (sum(borderlineMask(idx)) >= 10) || (sum(shortDropMaskFinal(idx)) >= 5);
+   if sum(isfinite(vals)) >= 5
+       riseAmt = max(vals,[],'omitnan') - min(vals,[],'omitnan');
+       HasRecoveryLikeBehavior(ep) = riseAmt >= recoveryRise_thr && HasBorderlineDrop(ep);
+   end
+   supportiveCount = HasBorderlineDrop(ep) + HasShortDropOver3(ep) + ...
+                     HasHighVariability(ep) + HasLowOxygenReserve(ep) + ...
+                     HasHighInstabilityBurden(ep) + HasRecoveryLikeBehavior(ep);
+   HasStrongSupportiveInstability(ep) = supportiveCount >= 2;
+   PoorSignal(ep) = ValidFraction(ep) < minEpochValidFrac;
+end
+epochTbl = table(EpochNumber, EpochStart_sec, EpochEnd_sec, MeanSpO2, MinSpO2, MaxSpO2, ...
+   BaselineMean, DropMagnitude, SpO2Std, ValidSamples, ValidFraction, ...
+   HasDesaturation, DesatDuration_sec, ...
+   'VariableNames', {'EpochNumber','EpochStart_sec','EpochEnd_sec','MeanSpO2','MinSpO2','MaxSpO2', ...
+   'BaselineMean','DropMagnitude','SpO2Std','ValidSamples','ValidFraction', ...
+   'HasDesaturation','DesatDuration_sec'});
+writetable(epochTbl, fullfile(outputFolder,'spo2_epoch_classification.csv'));
+fprintf('Saved: %s\n', fullfile(outputFolder,'spo2_epoch_classification.csv'));
+contextTbl = table(EpochNumber, EpochStart_sec, EpochEnd_sec, ...
+   HasBorderlineDrop, HasShortDropOver3, HasHighVariability, HasLowOxygenReserve, ...
+   HasHighInstabilityBurden, HasRecoveryLikeBehavior, HasStrongSupportiveInstability, PoorSignal, ...
+   'VariableNames', {'EpochNumber','EpochStart_sec','EpochEnd_sec', ...
+   'HasBorderlineDrop','HasShortDropOver3','HasHighVariability','HasLowOxygenReserve', ...
+   'HasHighInstabilityBurden','HasRecoveryLikeBehavior','HasStrongSupportiveInstability','PoorSignal'});
+writetable(contextTbl, fullfile(outputFolder,'spo2_contextual_epoch_flags.csv'));
+fprintf('Saved: %s\n', fullfile(outputFolder,'spo2_contextual_epoch_flags.csv'));
+%% =========================
+% STAGE 4: FINAL EPOCH LABELING
+%% =========================
+Label = strings(numEpochs,1);
+for ep = 1:numEpochs
+   if PoorSignal(ep)
+       Label(ep) = "PoorSignal";
+   elseif HasDesaturation(ep) || (isfinite(MeanSpO2(ep)) && MeanSpO2(ep) <= meanSpO2_abnormal_thr)
+       Label(ep) = "AbnormalOxygen";
+   elseif (isfinite(MeanSpO2(ep)) && MeanSpO2(ep) <= meanSpO2_support_thr) ...
+           || HasBorderlineDrop(ep) ...
+           || HasShortDropOver3(ep) ...
+           || HasHighVariability(ep) ...
+           || HasHighInstabilityBurden(ep) ...
+           || HasStrongSupportiveInstability(ep)
+       Label(ep) = "SupportiveOxygenChange";
+   else
+       Label(ep) = "NormalOxygenation";
+   end
+end
+finalTbl = table(EpochNumber, EpochStart_sec, EpochEnd_sec, ...
+   MeanSpO2, MinSpO2, MaxSpO2, BaselineMean, DropMagnitude, SpO2Std, ...
+   ValidSamples, ValidFraction, HasDesaturation, DesatDuration_sec, ...
+   HasBorderlineDrop, HasShortDropOver3, HasHighVariability, HasLowOxygenReserve, ...
+   HasHighInstabilityBurden, HasRecoveryLikeBehavior, HasStrongSupportiveInstability, ...
+   PoorSignal, Label);
+writetable(finalTbl, fullfile(outputFolder,'spo2_epoch_final_classification.csv'));
+fprintf('Saved: %s\n', fullfile(outputFolder,'spo2_epoch_final_classification.csv'));
+%% =========================
+% NIGHT-LEVEL SUMMARY
+%% =========================
+nNormal   = sum(Label == "NormalOxygenation");
+nSupport  = sum(Label == "SupportiveOxygenChange");
+nAbnormal = sum(Label == "AbnormalOxygen");
+nPoor     = sum(Label == "PoorSignal");
+if nAbnormal / max(numEpochs,1) >= 0.20
+   nightLabel = "AbnormalOxygenPattern";
+elseif (nAbnormal + nSupport) / max(numEpochs,1) >= 0.20
+   nightLabel = "SupportiveOxygenInstability";
+elseif nPoor / max(numEpochs,1) >= 0.50
+   nightLabel = "PoorSignalNight";
+else
+   nightLabel = "PredominantlyNormalOxygenation";
+end
+fprintf('\n============================================================\n');
+fprintf('        FINAL LOCKED CONSTRAINED-ADAPTIVE SpO2 SUMMARY\n');
+fprintf('============================================================\n');
+fprintf('Input file                              : %s\n', inputFile);
+fprintf('Estimated sampling rate                 : %.2f Hz\n', fs);
+fprintf('Recording duration                      : %.2f min\n', duration_sec/60);
+fprintf('\n[STAGE 1] RAW PPG / R / SpO2\n');
+fprintf('Total raw samples                       : %d\n', numel(t_sec));
+fprintf('Windowed R values                       : %d\n', numWins);
+fprintf('Locked PI rule                          : max(0.0008, prctile(PI,20)), capped at 0.0015\n');
+fprintf('Applied PI threshold                    : %.6f\n', pi_low_thr);
+fprintf('Remaining after quality + R filtering   : %d\n', numel(t_q));
+fprintf('Artifacts removed                       : %d\n', sum(artifactMask));
+fprintf('Final continuous SpO2 samples           : %d\n', numel(SpO2_clean));
+if ~isempty(SpO2_clean)
+   fprintf('Final SpO2 min / max / mean             : %.2f / %.2f / %.2f %%\n', ...
+       min(SpO2_clean), max(SpO2_clean), mean(SpO2_clean));
+else
+   fprintf('Final SpO2 min / max / mean             : N/A\n');
+end
+fprintf('\n[STAGE 2] LOCKED EVENT DETECTION\n');
+fprintf('1 Hz resampled SpO2 samples             : %d\n', numel(t_1hz));
+fprintf('Baseline window                         : %d sec\n', baselineWindow_sec);
+fprintf('Locked drop threshold                   : %.1f %%\n', desatDrop_thr);
+fprintf('Locked min event duration               : %d sec\n', desatMinDur_sec);
+fprintf('Detected desaturation events            : %d\n', height(eventsTbl));
+if height(eventsTbl) > 0
+   fprintf('Lowest event SpO2                       : %.2f %%\n', min(eventsTbl.MinSpO2));
+   fprintf('Largest drop from baseline              : %.2f %%\n', max(eventsTbl.MaxDropFromBaseline));
+else
+   fprintf('Lowest event SpO2                       : N/A\n');
+   fprintf('Largest drop from baseline              : N/A\n');
+end
+fprintf('\n[STAGE 3] FINAL LOCKED EPOCH CLASSIFICATION\n');
+fprintf('Epoch length                            : %d sec\n', epochLen_sec);
+fprintf('Number of full epochs                   : %d\n', numEpochs);
+fprintf('Normal epochs                           : %d\n', nNormal);
+fprintf('Supportive oxygen change epochs         : %d\n', nSupport);
+fprintf('Abnormal oxygen epochs                  : %d\n', nAbnormal);
+fprintf('PoorSignal epochs                       : %d\n', nPoor);
+fprintf('\n[LOCKED RULES]\n');
+fprintf('Quality gate                            : max(0.0008, prctile(PI,20)), capped at 0.0015\n');
+fprintf('Main abnormal rule                      : Desaturation event OR MeanSpO2<=90.0\n');
+fprintf('Support rule                            : MeanSpO2<=92.0 OR supportive instability flags\n');
+fprintf('Borderline contextual drop              : 2.0 to <3.0 %%\n');
+fprintf('Short contextual drop                   : >=3.0 %% for <10 sec\n');
+fprintf('\n[NIGHT-LEVEL SUMMARY]\n');
+fprintf('Night SpO2 label                        : %s\n', nightLabel);
+fprintf('Normal epochs %%                         : %.2f %%\n', 100*nNormal/max(numEpochs,1));
+fprintf('Supportive epochs %%                     : %.2f %%\n', 100*nSupport/max(numEpochs,1));
+fprintf('Abnormal epochs %%                       : %.2f %%\n', 100*nAbnormal/max(numEpochs,1));
+fprintf('PoorSignal epochs %%                     : %.2f %%\n', 100*nPoor/max(numEpochs,1));
+fprintf('\n[OUTPUT FILES]\n');
+fprintf('%s\n', fullfile(outputFolder,'spo2_recomputed_from_raw.csv'));
+fprintf('%s\n', fullfile(outputFolder,'spo2_final_artifact_rejected.csv'));
+fprintf('%s\n', fullfile(outputFolder,'spo2_desaturation_events.csv'));
+fprintf('%s\n', fullfile(outputFolder,'spo2_epoch_classification.csv'));
+fprintf('%s\n', fullfile(outputFolder,'spo2_contextual_epoch_flags.csv'));
+fprintf('%s\n', fullfile(outputFolder,'spo2_epoch_final_classification.csv'));
+fprintf('\nDone.\n');
+
