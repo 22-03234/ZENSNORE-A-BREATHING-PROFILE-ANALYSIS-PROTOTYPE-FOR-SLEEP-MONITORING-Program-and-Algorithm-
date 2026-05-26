@@ -1,9 +1,9 @@
 # Zensnore: Wearable Snore Monitoring and Sleep Analysis System
 
 ## Overview
-Zensnore is a capstone project focused on the development of a non-invasive wearable system for monitoring snoring activity and sleep-related respiratory parameters. The system integrates airflow sensing, snoring sound acquisition, and pulse oximetry monitoring to support sleep analysis and obstructive sleep apnea (OSA)-related studies.
+Zensnore is a capstone project developed by Biomedical Engineering students from Batangas State University in 2026. The project focuses on the development of a non-invasive wearable system designed for monitoring snoring activity and sleep-related respiratory parameters using airflow sensing, snoring sound acquisition, and pulse oximetry monitoring.
 
-This repository contains the source codes, embedded system programs, signal processing scripts, and related implementations used in the project.
+This repository contains the source codes, embedded system programs, signal processing scripts, and related implementations used throughout the study.
 
 ---
 
@@ -39,3 +39,26 @@ This repository contains the source codes, embedded system programs, signal proc
 ├── Documentation/
 ├── Figures/
 └── README.md
+```
+
+---
+
+## Researchers
+- BAGORIO, ARABELLA NADINE U.
+- CAGUIMBAL, MEA NOREEN D.
+- LAZAGA, PRINCESS SAMUELYN R.
+- VALENCIA, PEARL MARIE N.
+
+Biomedical Engineering Program  
+Batangas State University  
+2026
+
+---
+
+## Purpose
+This repository serves as the official codebase and technical reference for the Zensnore capstone project. It supports project documentation, reproducibility, and future improvements related to wearable sleep monitoring systems.
+
+---
+
+## Disclaimer
+This project is intended for academic and research purposes only and is not designed for clinical diagnosis or medical treatment.
