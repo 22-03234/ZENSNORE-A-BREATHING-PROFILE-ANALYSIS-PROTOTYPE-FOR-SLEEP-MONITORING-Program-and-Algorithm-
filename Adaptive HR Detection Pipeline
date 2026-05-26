@@ -1,0 +1,399 @@
+clear;
+close all;
+fprintf('\n============================================================\n');
+fprintf('      ZENSNORE ROBUST / ADAPTIVE HR PIPELINE FROM PPG.CSV\n');
+fprintf('============================================================\n');
+%% ============================================================
+% SETTINGS
+%% ============================================================
+input_file = 'ppg.csv';
+output_dir = 'hr_outputs';
+if ~exist(output_dir, 'dir')
+   mkdir(output_dir);
+end
+processed_file = fullfile(output_dir, 'ppg_hr_processed.csv');
+peaks_file     = fullfile(output_dir, 'ppg_hr_peaks.csv');
+trace_file     = fullfile(output_dir, 'ppg_hr_trace.csv');
+epoch_file     = fullfile(output_dir, 'hr_epoch_classification.csv');
+context_file   = fullfile(output_dir, 'hr_contextual_epoch_flags.csv');
+epoch_len_sec = 30;
+% Peak detection / HR extraction
+bandpass_low  = 0.6;    % Hz
+bandpass_high = 3.5;    % Hz
+filter_order  = 3;
+min_hr_bpm = 40;
+max_hr_bpm = 120;
+min_peak_distance_sec = 60 / max_hr_bpm;   % smallest allowed RR interval
+max_peak_distance_sec = 60 / min_hr_bpm;   % largest allowed RR interval
+% RR interval QC
+max_rr_jump_frac = 0.20;   % tighter than loose versions
+min_valid_rr_sec = 60 / max_hr_bpm;
+max_valid_rr_sec = 60 / min_hr_bpm;
+% HR smoothing
+hr_smooth_win_sec = 15;
+% Epoch QC thresholds
+min_samples_per_epoch_for_stable = 8;     % much stricter than before
+stable_hr_std_thresh = 6;                 % bpm
+unstable_hr_std_thresh = 12;              % bpm
+unstable_hr_range_thresh = 20;            % bpm
+% Coverage / confidence thresholds
+adequate_samples_per_min = 5;             % if below this, low-confidence
+poor_epoch_fraction_thresh = 0.60;        % if >60% poor epochs, low-confidence
+% Contextual support thresholds (STRICTER)
+sharp_rise_thresh_bpm = 10;               % pre-to-post rise
+sharp_dip_thresh_bpm  = 10;               % pre-to-post dip
+autonomic_delta_thresh = 12;              % stronger event-like change
+recovery_delta_thresh  = 8;               % meaningful recovery
+min_context_points = 6;                   % require enough HR points in epoch
+context_slope_thresh = 0.25;              % bpm/sec for event-like changes
+%% ============================================================
+% LOAD PPG
+%% ============================================================
+if ~isfile(input_file)
+   error('Missing input file: %s', input_file);
+end
+T = readtable(input_file);
+vars = string(T.Properties.VariableNames);
+if ismember("t_ns", vars)
+   t_sec = double(T.t_ns) * 1e-9;
+elseif ismember("time_s", vars)
+   t_sec = double(T.time_s);
+else
+   error('Input file must contain either t_ns or time_s.');
+end
+if ismember("RED", vars)
+   red = double(T.RED);
+elseif ismember("red", vars)
+   red = double(T.red);
+else
+   error('Input file must contain RED channel.');
+end
+valid0 = ~isnan(t_sec) & ~isnan(red);
+t_sec = t_sec(valid0);
+red   = red(valid0);
+t_sec = t_sec - t_sec(1);
+dt = median(diff(t_sec), 'omitnan');
+fs = 1 / dt;
+fprintf('Estimated sampling rate                : %.2f Hz\n', fs);
+fprintf('Recording duration                     : %.2f min\n', t_sec(end)/60);
+%% ============================================================
+% STAGE 1: BASIC SCREENING
+%% ============================================================
+adaptive_red_thresh = prctile(red, 10);
+keep = red > adaptive_red_thresh;
+t_keep = t_sec(keep);
+red_keep = red(keep);
+fprintf('Adaptive RED threshold used            : %.2f\n', adaptive_red_thresh);
+fprintf('Remaining samples after screening      : %d\n', numel(red_keep));
+if numel(red_keep) < fs * 60
+   error('Too few samples remain after RED screening.');
+end
+%% ============================================================
+% STAGE 2: FILTERING
+%% ============================================================
+[b, a] = butter(filter_order, [bandpass_low bandpass_high] / (fs/2), 'bandpass');
+red_filt = filtfilt(b, a, red_keep);
+% Robust normalization
+red_med = median(red_filt, 'omitnan');
+red_mad = mad(red_filt, 1);
+if red_mad == 0
+   red_mad = std(red_filt, 'omitnan');
+end
+if red_mad == 0
+   error('Filtered signal has near-zero variability.');
+end
+red_norm = (red_filt - red_med) / red_mad;
+%% ============================================================
+% STAGE 3: PEAK DETECTION
+%% ============================================================
+min_peak_distance_samples = max(1, round(min_peak_distance_sec * fs));
+% Adaptive prominence from filtered signal
+adaptive_prom = max(0.8, 0.5 * std(red_norm, 'omitnan'));
+[pks, locs] = findpeaks(red_norm, ...
+   'MinPeakDistance', min_peak_distance_samples, ...
+   'MinPeakProminence', adaptive_prom);
+peak_times = t_keep(locs);
+peak_amp   = pks;
+fprintf('Initial detected peaks                 : %d\n', numel(locs));
+fprintf('Peak amplitude threshold used          : %.6f\n', adaptive_prom);
+if numel(peak_times) < 20
+   error('Too few detected peaks for HR analysis.');
+end
+%% ============================================================
+% STAGE 4: RR INTERVAL QC
+%% ============================================================
+rr_sec = diff(peak_times);
+rr_time_sec = peak_times(2:end);
+valid_rr = rr_sec >= min_valid_rr_sec & rr_sec <= max_valid_rr_sec;
+% Jump filtering against running median
+rr_med_run = movmedian(rr_sec, 9, 'omitnan');
+jump_ok = true(size(rr_sec));
+for i = 1:numel(rr_sec)
+   if ~isnan(rr_med_run(i)) && rr_med_run(i) > 0
+       jump_ok(i) = abs(rr_sec(i) - rr_med_run(i)) / rr_med_run(i) <= max_rr_jump_frac;
+   end
+end
+valid_rr = valid_rr & jump_ok;
+rr_valid = rr_sec(valid_rr);
+rr_time_valid = rr_time_sec(valid_rr);
+if numel(rr_valid) < 30
+   error('Too few valid HR values after RR jump filtering.');
+end
+hr_bpm = 60 ./ rr_valid;
+% Additional HR plausibility filtering
+valid_hr = hr_bpm >= min_hr_bpm & hr_bpm <= max_hr_bpm;
+hr_bpm = hr_bpm(valid_hr);
+rr_time_valid = rr_time_valid(valid_hr);
+if numel(hr_bpm) < 30
+   error('Too few valid HR values after BPM plausibility filtering.');
+end
+% Smooth HR
+smooth_win_pts = max(3, round(hr_smooth_win_sec / median(diff(rr_time_valid), 'omitnan')));
+if mod(smooth_win_pts,2) == 0
+   smooth_win_pts = smooth_win_pts + 1;
+end
+hr_smooth = movmedian(hr_bpm, smooth_win_pts, 'omitnan');
+fprintf('Final usable HR samples                : %d\n', numel(hr_bpm));
+fprintf('Fallback HR mode used                  : NO\n');
+fprintf('\n================ HR SUMMARY ================\n');
+fprintf('Mean HR   : %.2f BPM\n', mean(hr_smooth, 'omitnan'));
+fprintf('Median HR : %.2f BPM\n', median(hr_smooth, 'omitnan'));
+fprintf('Min HR    : %.2f BPM\n', min(hr_smooth, [], 'omitnan'));
+fprintf('Max HR    : %.2f BPM\n', max(hr_smooth, [], 'omitnan'));
+fprintf('============================================\n');
+%% ============================================================
+% STAGE 5: SAVE BASE FILES
+%% ============================================================
+Processed = table(t_keep, red_keep, red_filt, red_norm, ...
+   'VariableNames', {'time_s','RED_screened','RED_filtered','RED_norm'});
+writetable(Processed, processed_file);
+Peaks = table(peak_times, peak_amp, ...
+   'VariableNames', {'peak_time_s','peak_amplitude'});
+writetable(Peaks, peaks_file);
+HRTrace = table(rr_time_valid, hr_bpm, hr_smooth, ...
+   'VariableNames', {'time_s','hr_bpm','hr_smooth_bpm'});
+writetable(HRTrace, trace_file);
+fprintf('Current working directory:\n%s\n', pwd);
+fprintf('Saving files to:\n%s\n%s\n%s\n', processed_file, peaks_file, trace_file);
+%% ============================================================
+% STAGE 6: EPOCH HR CLASSIFICATION
+%% ============================================================
+recording_dur_sec = t_sec(end);
+n_epochs = floor(recording_dur_sec / epoch_len_sec);
+EpochNumber     = (1:n_epochs)';
+EpochStart_sec  = (0:n_epochs-1)' * epoch_len_sec;
+EpochEnd_sec    = EpochStart_sec + epoch_len_sec;
+MeanHR          = nan(n_epochs,1);
+MedianHR        = nan(n_epochs,1);
+MinHR           = nan(n_epochs,1);
+MaxHR           = nan(n_epochs,1);
+StdHR           = nan(n_epochs,1);
+RangeHR         = nan(n_epochs,1);
+NumHRSamples    = zeros(n_epochs,1);
+Coverage_pct    = nan(n_epochs,1);
+PoorSignal      = false(n_epochs,1);
+Label           = strings(n_epochs,1);
+for e = 1:n_epochs
+   s0 = EpochStart_sec(e);
+   s1 = EpochEnd_sec(e);
+   idx = rr_time_valid >= s0 & rr_time_valid < s1;
+   x = hr_smooth(idx);
+   NumHRSamples(e) = sum(idx);
+   Coverage_pct(e) = 100 * NumHRSamples(e) / epoch_len_sec;  % approx samples per 30s
+   if isempty(x) || numel(x) < min_samples_per_epoch_for_stable
+       PoorSignal(e) = true;
+       Label(e) = "PoorSignal";
+       continue;
+   end
+   MeanHR(e)   = mean(x, 'omitnan');
+   MedianHR(e) = median(x, 'omitnan');
+   MinHR(e)    = min(x, [], 'omitnan');
+   MaxHR(e)    = max(x, [], 'omitnan');
+   StdHR(e)    = std(x, 'omitnan');
+   RangeHR(e)  = MaxHR(e) - MinHR(e);
+   if StdHR(e) <= stable_hr_std_thresh && RangeHR(e) <= 15
+       Label(e) = "HR stable";
+   elseif StdHR(e) >= unstable_hr_std_thresh || RangeHR(e) >= unstable_hr_range_thresh
+       Label(e) = "HR unstable";
+   else
+       Label(e) = "Intermediate";
+   end
+end
+EpochTable = table(EpochNumber, EpochStart_sec, EpochEnd_sec, ...
+   MeanHR, MedianHR, MinHR, MaxHR, StdHR, RangeHR, NumHRSamples, ...
+   Coverage_pct, PoorSignal, Label);
+%% ============================================================
+% STAGE 7: CONTEXTUAL HR FLAGS (STRICTER)
+%% ============================================================
+% These are intentionally strict so HR does not over-flag entire nights.
+SharpRise               = false(n_epochs,1);
+SharpDip                = false(n_epochs,1);
+RecoveryPattern         = false(n_epochs,1);
+HasAutonomicLikeResponse= false(n_epochs,1);
+HasMildSupportiveChange = false(n_epochs,1);
+Layer2SupportScore      = zeros(n_epochs,1);
+ContextLabel            = strings(n_epochs,1);
+for e = 1:n_epochs
+   s0 = EpochStart_sec(e);
+   s1 = EpochEnd_sec(e);
+   idx = rr_time_valid >= s0 & rr_time_valid < s1;
+   tt = rr_time_valid(idx);
+   xx = hr_smooth(idx);
+   if numel(xx) < min_context_points || PoorSignal(e)
+       ContextLabel(e) = "Insufficient HR context";
+       continue;
+   end
+   % Split epoch into thirds
+   dur = s1 - s0;
+   idx_pre  = tt >= s0 & tt < s0 + dur/3;
+   idx_mid  = tt >= s0 + dur/3 & tt < s0 + 2*dur/3;
+   idx_post = tt >= s0 + 2*dur/3 & tt < s1;
+   if sum(idx_pre) < 2 || sum(idx_post) < 2
+       ContextLabel(e) = "Insufficient HR context";
+       continue;
+   end
+   pre_mean  = mean(xx(idx_pre), 'omitnan');
+   mid_mean  = mean(xx(idx_mid), 'omitnan');
+   post_mean = mean(xx(idx_post), 'omitnan');
+   d_pre_post = post_mean - pre_mean;
+   d_pre_mid  = mid_mean - pre_mean;
+   d_mid_post = post_mean - mid_mean;
+   % Slope estimate
+   p = polyfit(tt - tt(1), xx, 1);
+   slope_bpm_per_sec = p(1);
+   % Strong rise/dip only
+   if d_pre_post >= sharp_rise_thresh_bpm && slope_bpm_per_sec >= context_slope_thresh
+       SharpRise(e) = true;
+       Layer2SupportScore(e) = Layer2SupportScore(e) + 1;
+   end
+   if d_pre_post <= -sharp_dip_thresh_bpm && slope_bpm_per_sec <= -context_slope_thresh
+       SharpDip(e) = true;
+       Layer2SupportScore(e) = Layer2SupportScore(e) + 1;
+   end
+   % Recovery pattern = dip then rebound or rise then settle
+   if d_pre_mid <= -recovery_delta_thresh && d_mid_post >= recovery_delta_thresh
+       RecoveryPattern(e) = true;
+       Layer2SupportScore(e) = Layer2SupportScore(e) + 1;
+   elseif d_pre_mid >= recovery_delta_thresh && d_mid_post <= -recovery_delta_thresh
+       RecoveryPattern(e) = true;
+       Layer2SupportScore(e) = Layer2SupportScore(e) + 1;
+   end
+   % Autonomic-like response requires stronger change + non-flat variability
+   if (abs(d_pre_post) >= autonomic_delta_thresh || RecoveryPattern(e)) && ...
+      StdHR(e) >= 4 && StdHR(e) <= 18 && ...
+      NumHRSamples(e) >= 10
+       HasAutonomicLikeResponse(e) = true;
+       Layer2SupportScore(e) = Layer2SupportScore(e) + 2;
+   end
+   % Mild support only if one strong pattern exists, not from tiny changes
+   if ~HasAutonomicLikeResponse(e) && ...
+      (SharpRise(e) || SharpDip(e) || RecoveryPattern(e)) && ...
+      abs(d_pre_post) >= 8
+       HasMildSupportiveChange(e) = true;
+       Layer2SupportScore(e) = Layer2SupportScore(e) + 1;
+   end
+   if HasAutonomicLikeResponse(e)
+       ContextLabel(e) = "Autonomic-like response";
+   elseif RecoveryPattern(e)
+       ContextLabel(e) = "Recovery-like change";
+   elseif SharpRise(e)
+       ContextLabel(e) = "Sharp rise";
+   elseif SharpDip(e)
+       ContextLabel(e) = "Sharp dip";
+   elseif HasMildSupportiveChange(e)
+       ContextLabel(e) = "Mild supportive change";
+   else
+       ContextLabel(e) = "No clear HR support";
+   end
+end
+ContextTable = table(EpochNumber, EpochStart_sec, EpochEnd_sec, ...
+   SharpRise, SharpDip, RecoveryPattern, ...
+   HasAutonomicLikeResponse, HasMildSupportiveChange, ...
+   Layer2SupportScore, ContextLabel);
+%% ============================================================
+% STAGE 8: RECORDING-LEVEL CONFIDENCE
+%% ============================================================
+valid_hr_samples_per_min = numel(hr_bpm) / (recording_dur_sec / 60);
+poor_epoch_frac = mean(PoorSignal);
+interp_support_used = false; % final version does not rely on interpolation for confidence
+if valid_hr_samples_per_min < adequate_samples_per_min || poor_epoch_frac > poor_epoch_fraction_thresh
+   final_qc_flag = "LOW-CONFIDENCE HR RECORDING";
+else
+   final_qc_flag = "ADEQUATE HR RECORDING";
+end
+%% ============================================================
+% SAVE EPOCH FILES
+%% ============================================================
+writetable(EpochTable, epoch_file);
+writetable(ContextTable, context_file);
+fprintf('\nSaved epoch files:\n');
+fprintf('- %s\n', epoch_file);
+fprintf('- %s\n', context_file);
+%% ============================================================
+% FINAL REPORT
+%% ============================================================
+fprintf('\n============================================================\n');
+fprintf('      ZENSNORE ROBUST / ADAPTIVE HR PIPELINE FROM PPG.CSV\n');
+fprintf('============================================================\n');
+fprintf('Recording duration                     : %.2f min\n', recording_dur_sec/60);
+fprintf('Estimated sampling rate                : %.2f Hz\n', fs);
+fprintf('Adaptive RED threshold                 : %.2f\n', adaptive_red_thresh);
+fprintf('Initial detected peaks                 : %d\n', numel(peak_times));
+fprintf('Final retained peaks (QC screened)     : %d\n', numel(rr_valid));
+fprintf('Valid HR samples                       : %d\n', numel(hr_bpm));
+fprintf('Valid HR samples per minute            : %.2f\n', valid_hr_samples_per_min);
+fprintf('Fallback HR mode used                  : false\n');
+fprintf('Interpolation support used             : %s\n', string(interp_support_used));
+if final_qc_flag == "LOW-CONFIDENCE HR RECORDING"
+   fprintf('WARNING: HR coverage is sparse; treat HR interpretation as low-confidence.\n');
+end
+fprintf('FINAL QC FLAG                          : %s\n', final_qc_flag);
+fprintf('\n================ HR SUMMARY ================\n');
+fprintf('Mean HR                                : %.2f BPM\n', mean(hr_smooth, 'omitnan'));
+fprintf('Median HR                              : %.2f BPM\n', median(hr_smooth, 'omitnan'));
+fprintf('Min HR                                 : %.2f BPM\n', min(hr_smooth, [], 'omitnan'));
+fprintf('Max HR                                 : %.2f BPM\n', max(hr_smooth, [], 'omitnan'));
+fprintf('============================================\n');
+fprintf('\n[LAYER 1] EPOCH HR SUMMARY\n');
+fprintf('Number of full epochs                  : %d\n', n_epochs);
+fprintf('HR stable epochs                       : %d\n', sum(Label == "HR stable"));
+fprintf('HR unstable epochs                     : %d\n', sum(Label == "HR unstable"));
+fprintf('PoorSignal epochs                      : %d\n', sum(PoorSignal));
+fprintf('\n[LAYER 2] SUPPORTIVE HR CONTEXT\n');
+fprintf('Epochs with sharp rise                 : %d\n', sum(SharpRise));
+fprintf('Epochs with sharp dip                  : %d\n', sum(SharpDip));
+fprintf('Epochs with recovery pattern           : %d\n', sum(RecoveryPattern));
+fprintf('Epochs with autonomic-like response    : %d\n', sum(HasAutonomicLikeResponse));
+fprintf('Epochs with mild supportive HR change  : %d\n', sum(HasMildSupportiveChange));
+fprintf('\nSaved files:\n');
+fprintf('- %s\n', processed_file);
+fprintf('- %s\n', peaks_file);
+fprintf('- %s\n', trace_file);
+fprintf('- %s\n', epoch_file);
+fprintf('- %s\n', context_file);
+fprintf('============================================================\n');
+% Optional diagnostic: lowest HR
+[~, idx_min_hr] = min(hr_smooth);
+fprintf('\nLowest HR occurs around %.2f seconds\n', rr_time_valid(idx_min_hr));
+%% ============================================================
+% OPTIONAL PLOT
+%% ============================================================
+figure('Color','w','Position',[100 100 1200 650]);
+subplot(2,1,1);
+plot(t_keep, red_norm, 'k');
+hold on;
+plot(peak_times, peak_amp, 'ro', 'MarkerSize', 3);
+xlabel('Time (s)');
+ylabel('Normalized RED');
+title('Filtered PPG with Detected Peaks');
+grid on;
+subplot(2,1,2);
+plot(rr_time_valid, hr_bpm, '.', 'DisplayName', 'HR raw');
+hold on;
+plot(rr_time_valid, hr_smooth, 'LineWidth', 1.5, 'DisplayName', 'HR smooth');
+xlabel('Time (s)');
+ylabel('HR (BPM)');
+title(sprintf('HR Trace (%s)', final_qc_flag));
+legend('Location','best');
+grid on;
+
