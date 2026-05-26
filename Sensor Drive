@@ -1,0 +1,245 @@
+import smbus
+import time
+import numpy as np
+
+
+
+
+# MAX30102 registers
+REG_INTR_STATUS_1 = 0x00
+REG_INTR_STATUS_2 = 0x01
+REG_INTR_ENABLE_1 = 0x02
+REG_INTR_ENABLE_2 = 0x03
+REG_FIFO_WR_PTR = 0x04
+REG_OVF_COUNTER = 0x05
+REG_FIFO_RD_PTR = 0x06
+REG_FIFO_DATA = 0x07
+REG_FIFO_CONFIG = 0x08
+REG_MODE_CONFIG = 0x09
+REG_SPO2_CONFIG = 0x0A
+REG_LED1_PA = 0x0C
+REG_LED2_PA = 0x0D
+REG_PILOT_PA = 0x10
+
+
+
+
+class MAX30102:
+
+
+    def __init__(self, bus=1, address=0x57):
+
+
+        self.address = address
+        self.bus = smbus.SMBus(bus)
+
+
+        self.reset()
+        time.sleep(1)
+
+
+        self.setup()
+
+
+    def reset(self):
+
+
+        self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [0x40])
+
+
+    def shutdown(self):
+
+
+        self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [0x80])
+
+
+    def setup(self, led_mode=0x03):
+
+
+        self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_1, [0xc0])
+        self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_2, [0x00])
+
+
+        self.bus.write_i2c_block_data(self.address, REG_FIFO_WR_PTR, [0x00])
+        self.bus.write_i2c_block_data(self.address, REG_OVF_COUNTER, [0x00])
+        self.bus.write_i2c_block_data(self.address, REG_FIFO_RD_PTR, [0x00])
+
+
+        self.bus.write_i2c_block_data(self.address, REG_FIFO_CONFIG, [0x4f])
+
+
+        self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [led_mode])
+
+
+        self.bus.write_i2c_block_data(self.address, REG_SPO2_CONFIG, [0x27])
+
+
+        self.bus.write_i2c_block_data(self.address, REG_LED1_PA, [0x24])
+        self.bus.write_i2c_block_data(self.address, REG_LED2_PA, [0x24])
+        self.bus.write_i2c_block_data(self.address, REG_PILOT_PA, [0x7F])
+
+
+    def get_samples_available(self):
+
+
+        read_ptr = self.bus.read_byte_data(self.address, REG_FIFO_RD_PTR)
+        write_ptr = self.bus.read_byte_data(self.address, REG_FIFO_WR_PTR)
+
+
+        samples = write_ptr - read_ptr
+
+
+        if samples < 0:
+            samples += 32
+
+
+        return samples
+
+
+    def read_fifo(self):
+
+
+        self.bus.read_i2c_block_data(self.address, REG_INTR_STATUS_1, 1)
+        self.bus.read_i2c_block_data(self.address, REG_INTR_STATUS_2, 1)
+
+
+        data = self.bus.read_i2c_block_data(self.address, REG_FIFO_DATA, 6)
+
+
+        red = (data[0] << 16 | data[1] << 8 | data[2]) & 0x03FFFF
+        ir = (data[3] << 16 | data[4] << 8 | data[5]) & 0x03FFFF
+
+
+        return red, ir
+
+
+    def read_samples(self, n=200):
+
+
+        red_buf = []
+        ir_buf = []
+
+
+        while len(red_buf) < n:
+
+
+            samples = self.get_samples_available()
+
+
+            if samples == 0:
+                time.sleep(0.01)
+                continue
+
+
+            for _ in range(samples):
+
+
+                red, ir = self.read_fifo()
+
+
+                red_buf.append(red)
+                ir_buf.append(ir)
+
+
+                if len(red_buf) >= n:
+                    break
+
+
+        return np.array(red_buf), np.array(ir_buf)
+    def set_config(self, reg, value):
+        self.bus.write_i2c_block_data(self.address, reg, [value])
+
+
+# -----------------------------
+# SIGNAL PROCESSING FUNCTIONS
+# -----------------------------
+
+
+def remove_dc(signal):
+
+
+    return signal - np.mean(signal)
+
+
+
+
+def moving_average(signal, window=5):
+
+
+    return np.convolve(signal, np.ones(window)/window, mode='same')
+
+
+
+
+def bandpass_ppg(signal):
+
+
+    filtered = moving_average(signal, 5)
+    filtered = moving_average(filtered, 5)
+
+
+    return filtered
+
+
+
+
+def detect_peaks(signal):
+
+
+    peaks = []
+
+
+    for i in range(1, len(signal)-1):
+
+
+        if signal[i] > signal[i-1] and signal[i] > signal[i+1]:
+
+
+            peaks.append(i)
+
+
+    return peaks
+
+
+
+
+def estimate_bpm(signal, fs=100):
+
+
+    peaks = detect_peaks(signal)
+
+
+    if len(peaks) < 2:
+        return 0
+
+
+    intervals = np.diff(peaks) / fs
+
+
+    bpm = 60 / np.mean(intervals)
+
+
+    return bpm
+
+
+
+
+def estimate_spo2(red, ir):
+
+
+    red_ac = np.std(red)
+    red_dc = np.mean(red)
+
+
+    ir_ac = np.std(ir)
+    ir_dc = np.mean(ir)
+
+
+    R = (red_ac/red_dc) / (ir_ac/ir_dc)
+
+
+    spo2 = 110 - 25 * R
+
+
+    return spo2
+
