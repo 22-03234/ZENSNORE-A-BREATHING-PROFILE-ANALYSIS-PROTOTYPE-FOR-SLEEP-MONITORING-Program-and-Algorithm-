@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+"""
+ZenSnore Standalone Recorder (2 buttons + 3 LEDs) with software-only corruption mitigation.
+
+
+LED states:
+- Boot / idle armed: ALL ON (green+yellow+red)
+- Recording: GREEN only
+- Stopped (after recording): YELLOW only (until Button1 pressed)
+- Shutdown warning: RED blink, then safe shutdown
+
+
+Buttons (BCM):
+- Button1 (GPIO5): safe shutdown
+- Button2 (GPIO6): toggle recording start/stop
+
+
+Files per session in ./runs/run_YYYYmmdd_HHMMSS/:
+- airflow.csv     @100 Hz: t_ns, pressure_kpa_zeroed
+- ppg.csv         @100 Hz: t_ns, RED, IR, fs_eff_hz, ir_dc, red_dc, ir_ac_rms, red_ac_rms, R
+                  (1 Hz columns filled every 100th row; others blank)
+- audio.wav       @8 kHz: 32-bit PCM container
+- audio_freq.csv  ~1 Hz: t_ns, rms, peak_hz
+- run_metadata.json
+"""
+
+
+import os
+import json
+import csv
+import time
+import signal
+import threading
+import subprocess
+from collections import deque
+
+
+import numpy as np
+from smbus2 import SMBus
+import RPi.GPIO as GPIO
+
+
+# Import MAX30102 driver
+import sys
+sys.path.insert(0, os.path.expanduser("~"))
+from max30102_driver import MAX30102
+
+
+GPIO.setwarnings(False)
+
+
+# =========================
+# GPIO CONFIG (BCM) - YOUR SETUP
+# =========================
+PIN_GREEN  = 23
+PIN_YELLOW = 24
+PIN_RED    = 12
+
+
+BTN_SHUTDOWN = 5    # Button 1
+BTN_RECORD   = 6    # Button 2
+
+
+DEBOUNCE_SEC = 0.30
+
+
+
+
+# =========================
+# FILE SAFETY SETTINGS
+# =========================
+FSYNC_SEC = 5.0
+OS_SYNC_SEC = 10.0
+
+
+
+
+# =========================
+# ACQUISITION SETTINGS
+# =========================
+OUT_ROOT = os.path.expanduser("~/runs")
+
+
+# Airflow (MPXV7002DP -> ADS1115)
+I2C_BUS = 1
+ADS_ADDR = 0x48
+ADS_CHANNEL = 0
+
+
+ADS_FS_V = 4.096
+PGA_BITS = 0b001
+ADS_ADC_RATE = 860
+
+
+AIRFLOW_FS = 100
+AIRFLOW_ZERO_SEC = 1.5
+MPX_VS_SUPPLY = 3.3
+
+
+# PPG (MAX30102)
+PPG_SENSOR_FS = 100
+PPG_WINDOW_SEC = 10.0
+PPG_MIN_WINDOW_SEC = 5.0
+PPG_LED_RED_PA = 0x1F
+PPG_LED_IR_PA  = 0x1F
+
+
+# Audio (INMP441 via ALSA arecord) - YOUR CARD 1
+ALSA_DEVICE = "plughw:1,0"
+AUDIO_FS = 8000
+AUDIO_FORMAT = "S32_LE"
+AUDIO_CHANNELS = 1
+AUDIO_SAMPWIDTH_BYTES = 4
+
+
+AUDIO_READ_CHUNK_SEC = 0.1
+AUDIO_FREQ_WINDOW_SEC = 1.0
+AUDIO_BAND_MIN = 20
+AUDIO_BAND_MAX = 2000
+AUDIO_USE_HANN = True
+AUDIO_RMS_MIN = 0.00015
+
+
+
+
+# =========================
+# ADS1115 helpers
+# =========================
+REG_CONVERSION = 0x00
+REG_CONFIG     = 0x01
+
+
+DR_MAP = {
+    8:0b000,16:0b001,32:0b010,64:0b011,
+    128:0b100,250:0b101,475:0b110,860:0b111
+}
+
+
+def ads_mux_bits(ch: int) -> int:
+    return {0:0b100,1:0b101,2:0b110,3:0b111}[ch]
+
+
+def ads_write_config(bus: SMBus) -> None:
+    config = (
+        (1<<15) |
+        (ads_mux_bits(ADS_CHANNEL)<<12) |
+        (PGA_BITS<<9) |
+        (1<<8) |
+        (DR_MAP[ADS_ADC_RATE]<<5) |
+        (0b11)
+    )
+    bus.write_i2c_block_data(
+        ADS_ADDR, REG_CONFIG,
+        [(config>>8) & 0xFF, config & 0xFF]
+    )
+
+
+def ads_read_raw(bus: SMBus) -> int:
+    data = bus.read_i2c_block_data(ADS_ADDR, REG_CONVERSION, 2)
+    raw = (data[0]<<8) | data[1]
+    if raw & 0x8000:
+        raw -= 1<<16
+    return raw
+
+
+def raw_to_voltage(raw: int) -> float:
+    return (raw / 32768.0) * ADS_FS_V
+
+
+def voltage_to_kpa(v: float) -> float:
+    return (v / MPX_VS_SUPPLY - 0.5) / 0.2
+
+
+
+
+# =========================
+# Audio helpers
+# =========================
+def parabolic_peak(freqs_band: np.ndarray, mag_band: np.ndarray, k: int) -> float:
+    if k <= 0 or k >= len(mag_band) - 1:
+        return float(freqs_band[k])
+    a = mag_band[k-1]
+    b = mag_band[k]
+    c = mag_band[k+1]
+    denom = (a - 2*b + c)
+    if denom == 0:
+        return float(freqs_band[k])
+    delta = 0.5 * (a - c) / denom
+    df = freqs_band[1] - freqs_band[0]
+    return float(freqs_band[k] + delta * df)
+
+
+
+
+# =========================
+# LED control
+# =========================
+def gpio_init():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(PIN_GREEN, GPIO.OUT, initial=GPIO.HIGH)
+    GPIO.setup(PIN_YELLOW, GPIO.OUT, initial=GPIO.HIGH)
+    GPIO.setup(PIN_RED, GPIO.OUT, initial=GPIO.HIGH)
+    GPIO.setup(BTN_SHUTDOWN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(BTN_RECORD, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+
+def leds_all_on():
+    GPIO.output(PIN_GREEN, GPIO.LOW)
+    GPIO.output(PIN_YELLOW, GPIO.LOW)
+    GPIO.output(PIN_RED, GPIO.LOW)
+
+
+def leds_recording():
+    GPIO.output(PIN_GREEN, GPIO.LOW)
+    GPIO.output(PIN_YELLOW, GPIO.HIGH)
+    GPIO.output(PIN_RED, GPIO.HIGH)
+
+
+def leds_stopped_yellow():
+    GPIO.output(PIN_GREEN, GPIO.HIGH)
+    GPIO.output(PIN_YELLOW, GPIO.LOW)
+    GPIO.output(PIN_RED, GPIO.HIGH)
+
+
+def leds_off():
+    GPIO.output(PIN_GREEN, GPIO.HIGH)
+    GPIO.output(PIN_YELLOW, GPIO.HIGH)
+    GPIO.output(PIN_RED, GPIO.HIGH)
+
+
+def blink_red(duration_s=2.0, period_s=0.2):
+    t_end = time.monotonic() + duration_s
+    on = False
+    while time.monotonic() < t_end:
+        on = not on
+        GPIO.output(PIN_RED, GPIO.HIGH if on else GPIO.LOW)
+        time.sleep(period_s)
+    GPIO.output(PIN_RED, GPIO.LOW)
+
+
+
+
+# =========================
+# File safety helpers
+# =========================
+def safe_flush_fsync(file_obj):
+    try:
+        file_obj.flush()
+        os.fsync(file_obj.fileno())
+    except Exception:
+        pass
+
+
+
+
+# =========================
+# PPG shared buffer
+# =========================
+class PPGBuffer:
+    def __init__(self, maxlen: int):
+        self.lock = threading.Lock()
+        self.ts_ns = deque(maxlen=maxlen)
+        self.red   = deque(maxlen=maxlen)
+        self.ir    = deque(maxlen=maxlen)
+
+
+ppg_buf = PPGBuffer(maxlen=int(PPG_SENSOR_FS * PPG_WINDOW_SEC * 4))
+i2c_lock = threading.Lock()
+
+
+def compute_ppg_metrics(ts_ns_arr, ir_arr, red_arr):
+    n = len(ts_ns_arr)
+    if n < 3:
+        return None
+    dt_s = (ts_ns_arr[-1] - ts_ns_arr[0]) / 1e9
+    if dt_s <= 1e-6:
+        return None
+    fs_eff = (n - 1) / dt_s
+    ir_dc = float(np.mean(ir_arr))
+    red_dc = float(np.mean(red_arr))
+    if ir_dc <= 1e-6 or red_dc <= 1e-6:
+        return None
+    win = max(5, int(0.5 * fs_eff))
+    if n > win:
+        kernel = np.ones(win, dtype=np.float64) / win
+        ma_ir = np.convolve(ir_arr, kernel, mode="same")
+        ma_red = np.convolve(red_arr, kernel, mode="same")
+        ac_ir = ir_arr - ma_ir
+        ac_red = red_arr - ma_red
+    else:
+        ac_ir = ir_arr - ir_dc
+        ac_red = red_arr - red_dc
+    ir_ac_rms = float(np.std(ac_ir))
+    red_ac_rms = float(np.std(ac_red))
+    if ir_ac_rms <= 1e-12 or red_ac_rms <= 1e-12:
+        return None
+    R = (red_ac_rms / red_dc) / (ir_ac_rms / ir_dc + 1e-12)
+    return ir_dc, red_dc, ir_ac_rms, red_ac_rms, float(R)
+
+
+
+
+# =========================
+# Acquisition session
+# =========================
+class AcquisitionSession:
+    def __init__(self):
+        self.run_dir = None
+        self.t0_ns = None
+        self.p0_kpa = 0.0
+        self._stop = threading.Event()
+        self.sensor = None
+        self.th_ppg_reader = None
+        self.th_airflow = None
+        self.th_ppg_writer = None
+        self.th_audio = None
+
+
+    def start(self):
+        self._stop.clear()
+        run_id = time.strftime("%Y%m%d_%H%M%S")
+        self.run_dir = os.path.join(OUT_ROOT, f"run_{run_id}")
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.t0_ns = time.monotonic_ns()
+
+
+        self.sensor = MAX30102()
+        self.sensor.set_config(0x09, 0x03)
+        self.sensor.set_config(0x0A, 0x23)
+        self.sensor.set_config(0x0C, PPG_LED_RED_PA)
+        self.sensor.set_config(0x0D, PPG_LED_IR_PA)
+        self.sensor.set_config(0x08, 0x4F)
+
+
+        # Airflow baseline
+        self.p0_kpa = self._airflow_calibrate_p0()
+
+
+        # Metadata
+        meta = {
+            "t0_ns": self.t0_ns,
+            "files": {
+                "airflow_csv": "airflow.csv",
+                "ppg_csv": "ppg.csv",
+                "audio_wav": "audio.wav",
+                "audio_freq_csv": "audio_freq.csv",
+            },
+            "airflow": {
+                "ads_addr": hex(ADS_ADDR),
+                "channel": ADS_CHANNEL,
+                "target_fs_hz": AIRFLOW_FS,
+                "ads_data_rate_sps": ADS_ADC_RATE,
+                "ads_fullscale_v": ADS_FS_V,
+                "vs_supply_v": MPX_VS_SUPPLY,
+                "baseline_p0_kpa": self.p0_kpa,
+            },
+            "ppg": {
+                "sensor_fs_hz": PPG_SENSOR_FS,
+                "window_sec": PPG_WINDOW_SEC,
+            },
+            "audio": {
+                "device": ALSA_DEVICE,
+                "fs_hz": AUDIO_FS,
+                "format": AUDIO_FORMAT,
+                "band_hz": [AUDIO_BAND_MIN, AUDIO_BAND_MAX],
+            }
+        }
+        with open(os.path.join(self.run_dir, "run_metadata.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+
+        # Start threads
+        self.th_ppg_reader = threading.Thread(target=self._ppg_reader_loop, daemon=True)
+        self.th_airflow    = threading.Thread(target=self._airflow_loop, daemon=True)
+        self.th_ppg_writer = threading.Thread(target=self._ppg_writer_loop, daemon=True)
+        self.th_audio      = threading.Thread(target=self._audio_loop, daemon=True)
+
+
+        self.th_ppg_reader.start()
+        time.sleep(0.5)
+
+
+        self.th_airflow.start()
+        self.th_ppg_writer.start()
+        self.th_audio.start()
+
+
+        print(f"[REC] Started. Folder: {self.run_dir}")
+
+
+    def stop(self):
+        self._stop.set()
+        for th in [self.th_airflow, self.th_ppg_writer, self.th_audio, self.th_ppg_reader]:
+            if th is not None:
+                th.join(timeout=3.0)
+        try:
+            if self.sensor is not None:
+                self.sensor.shutdown()
+        except Exception:
+            pass
+        try:
+            os.sync()
+        except Exception:
+            pass
+        print("[REC] Stopped cleanly.")
+
+
+    def _airflow_calibrate_p0(self) -> float:
+        baseline_v = []
+        with SMBus(I2C_BUS) as bus:
+            t_end = time.monotonic_ns() + int(AIRFLOW_ZERO_SEC * 1e9)
+            while time.monotonic_ns() < t_end:
+                with i2c_lock:
+                    ads_write_config(bus)
+                    time.sleep(1.0 / ADS_ADC_RATE)
+                    raw = ads_read_raw(bus)
+                baseline_v.append(raw_to_voltage(raw))
+        if not baseline_v:
+            return 0.0
+        v0 = float(np.median(np.array(baseline_v, dtype=np.float64)))
+        return voltage_to_kpa(v0)
+
+
+    def _ppg_reader_loop(self):
+        period_ns = int(1e9 / PPG_SENSOR_FS)
+        next_ns = time.monotonic_ns()
+
+
+        while not self._stop.is_set():
+            now_ns = time.monotonic_ns()
+            if now_ns < next_ns:
+                time.sleep(0.001)
+                continue
+
+
+            try:
+                # Check how many samples are available in FIFO
+                with i2c_lock:
+                    num_samples = self.sensor.get_samples_available()
+
+
+                # If none reported, still attempt one read
+                if num_samples == 0:
+
+
+                    with i2c_lock:
+                        red, ir = self.sensor.read_fifo()
+                    t_ns = time.monotonic_ns()
+
+
+                    with ppg_buf.lock:
+                        ppg_buf.ts_ns.append(t_ns)
+                        ppg_buf.red.append(int(red))
+                        ppg_buf.ir.append(int(ir))
+
+
+                    # SHORTER sleep (prevents FIFO starvation)
+                    time.sleep(0.001)
+                    continue
+
+
+                # Read all samples currently in FIFO
+                for _ in range(num_samples):
+
+
+                    with i2c_lock:
+                        red, ir = self.sensor.read_fifo()
+                    t_ns = time.monotonic_ns()
+
+
+                    with ppg_buf.lock:
+                        ppg_buf.ts_ns.append(t_ns)
+                        ppg_buf.red.append(int(red))
+                        ppg_buf.ir.append(int(ir))
+
+
+                # small throttle so CPU doesn't spin at 100%
+                time.sleep(0.001)
+
+
+            except Exception as e:
+                print("PPG ERROR:", e)
+                time.sleep(0.005)
+
+
+    def _airflow_loop(self):
+        path = os.path.join(self.run_dir, "airflow.csv")
+        period_ns = int(1e9 / AIRFLOW_FS)
+        last_fsync = time.monotonic()
+
+
+        with SMBus(I2C_BUS) as bus, open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["t_ns", "pressure_kpa_zeroed", "flow_direction"])
+            next_ns = time.monotonic_ns()
+
+
+            while not self._stop.is_set():
+                now_ns = time.monotonic_ns()
+                if now_ns >= next_ns:
+                    t_ns = int(time.monotonic_ns())
+                    with i2c_lock:
+                        ads_write_config(bus)
+                        time.sleep(1.0 / ADS_ADC_RATE)
+                        raw = ads_read_raw(bus)
+                    v = raw_to_voltage(raw)
+                    p = voltage_to_kpa(v)
+                    p_zero = p - self.p0_kpa
+                    if p_zero < 0:
+                        flow_dir = "inhale"
+                    elif p_zero > 0:
+                        flow_dir = "exhale"
+                    else:
+                        flow_dir = "neutral"
+                    w.writerow([t_ns, f"{p_zero:+.6f}", flow_dir])
+                    next_ns += period_ns
+                    if now_ns - next_ns > 5 * period_ns:
+                        next_ns = now_ns + period_ns
+
+
+                if (time.monotonic() - last_fsync) >= FSYNC_SEC:
+                    safe_flush_fsync(f)
+                    last_fsync = time.monotonic()
+                time.sleep(0.0005)
+            safe_flush_fsync(f)
+
+
+    def _ppg_writer_loop(self):
+
+
+        path = os.path.join(self.run_dir, "ppg.csv")
+        period_ns = int(1e9 / AIRFLOW_FS)
+
+
+        sample_idx = 0
+        last_metrics = None
+        last_fsync = time.monotonic()
+
+
+        with open(path, "w", newline="") as f:
+
+
+            w = csv.writer(f)
+
+
+            w.writerow([
+                "t_ns","RED","IR",
+                "ir_dc","red_dc",
+                "ir_ac_rms","red_ac_rms","R"
+            ])
+
+
+            next_ns = time.monotonic_ns()
+
+
+            while not self._stop.is_set():
+
+
+                now_ns = time.monotonic_ns()
+
+
+                if now_ns >= next_ns:
+
+
+                    t_ns = int(now_ns)
+                    sample_idx += 1
+
+
+                    with ppg_buf.lock:
+
+
+                        if len(ppg_buf.red) == 0:
+                            red_last, ir_last = 0, 0
+                        else:
+                            red_last = int(ppg_buf.red[-1])
+                            ir_last  = int(ppg_buf.ir[-1])
+
+
+                        if (
+                            sample_idx % AIRFLOW_FS == 0 and
+                            len(ppg_buf.ts_ns) >= int(PPG_SENSOR_FS * PPG_MIN_WINDOW_SEC)
+                        ):
+
+
+                            ts = np.array(ppg_buf.ts_ns)
+                            ir = np.array(ppg_buf.ir)
+                            red = np.array(ppg_buf.red)
+
+
+                            t_end = ts[-1]
+                            t_start = t_end - int(PPG_WINDOW_SEC * 1e9)
+
+
+                            mask = ts >= t_start
+
+
+                            ts_w = ts[mask]
+                            ir_w = ir[mask]
+                            red_w = red[mask]
+
+
+                            if ts_w.size >= int(PPG_SENSOR_FS * PPG_MIN_WINDOW_SEC):
+                                last_metrics = compute_ppg_metrics(ts_w, ir_w, red_w)
+                            else:
+                                last_metrics = None
+
+
+                    if sample_idx % AIRFLOW_FS == 0 and last_metrics:
+
+
+                        ir_dc, red_dc, ir_ac_rms, red_ac_rms, R = last_metrics
+
+
+                        w.writerow([
+                            t_ns, red_last, ir_last,
+                            f"{ir_dc:.2f}",
+                            f"{red_dc:.2f}",
+                            f"{ir_ac_rms:.2f}",
+                            f"{red_ac_rms:.2f}",
+                            f"{R:.4f}",
+                        ])
+
+
+                    else:
+
+
+                        w.writerow([
+                            t_ns, red_last, ir_last,
+                            "", "", "", "", "", ""
+                        ])
+
+
+                    next_ns += period_ns
+
+
+                    if now_ns - next_ns > 5 * period_ns:
+                        next_ns = now_ns + period_ns
+
+
+                if time.monotonic() - last_fsync >= FSYNC_SEC:
+                    safe_flush_fsync(f)
+                    last_fsync = time.monotonic()
+
+
+                time.sleep(0.0005)
+
+
+            safe_flush_fsync(f)
+
+
+    def _audio_loop(self):
+        import wave
+
+
+        wav_path  = os.path.join(self.run_dir, "audio.wav")
+        freq_path = os.path.join(self.run_dir, "audio_freq.csv")
+
+
+        cmd = [
+            "arecord",
+            "-D", ALSA_DEVICE,
+            "-r", str(AUDIO_FS),
+            "-f", AUDIO_FORMAT,
+            "-c", str(AUDIO_CHANNELS),
+            "-t", "raw"
+        ]
+
+
+        wf = wave.open(wav_path, "wb")
+        wf.setnchannels(AUDIO_CHANNELS)
+        wf.setsampwidth(AUDIO_SAMPWIDTH_BYTES)
+        wf.setframerate(AUDIO_FS)
+
+
+        fcsv = open(freq_path, "w", newline="")
+        fw = csv.writer(fcsv)
+        fw.writerow(["t_ns", "rms", "peak_hz"])
+
+
+        n_chunk = int(AUDIO_FS * AUDIO_READ_CHUNK_SEC)
+        read_bytes = n_chunk * AUDIO_SAMPWIDTH_BYTES
+        n_win = int(AUDIO_FS * AUDIO_FREQ_WINDOW_SEC)
+        acc = np.empty(0, dtype=np.float32)
+        last_fsync = time.monotonic()
+
+
+        while not self._stop.is_set():
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+            try:
+                while not self._stop.is_set():
+                    raw = p.stdout.read(read_bytes)
+                    if not raw or len(raw) < read_bytes:
+                        break
+
+
+                    wf.writeframesraw(raw)
+                    x = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+                    x = x - float(np.mean(x))
+                    acc = np.append(acc, x)
+
+
+                    while acc.size >= n_win:
+                        win = acc[:n_win]
+                        acc = acc[n_win:]
+                        t_ns = int(time.monotonic_ns())
+                        rms = float(np.sqrt(np.mean(win**2)))
+                        if rms < AUDIO_RMS_MIN:
+                            fw.writerow([t_ns, f"{rms:.6f}", ""])
+                            continue
+                        xw = win
+                        if AUDIO_USE_HANN:
+                            xw = xw * np.hanning(xw.size).astype(np.float32)
+                        X = np.fft.rfft(xw)
+                        freqs = np.fft.rfftfreq(xw.size, d=1.0 / AUDIO_FS)
+                        mag = np.abs(X)
+                        band = (freqs >= AUDIO_BAND_MIN) & (freqs <= AUDIO_BAND_MAX)
+                        freqs_b = freqs[band]
+                        mag_b = mag[band]
+                        if mag_b.size == 0:
+                            fw.writerow([t_ns, f"{rms:.6f}", ""])
+                            continue
+                        k = int(np.argmax(mag_b))
+                        peak_hz = parabolic_peak(freqs_b, mag_b, k)
+                        fw.writerow([t_ns, f"{rms:.6f}", f"{peak_hz:.2f}"])
+
+
+                    if (time.monotonic() - last_fsync) >= FSYNC_SEC:
+                        try:
+                            wf._file.flush()
+                            os.fsync(wf._file.fileno())
+                        except Exception:
+                            pass
+                        safe_flush_fsync(fcsv)
+                        last_fsync = time.monotonic()
+
+
+            finally:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+
+        try:
+            wf.close()
+        except Exception:
+            pass
+
+
+        try:
+            safe_flush_fsync(fcsv)
+            fcsv.close()
+        except Exception:
+            pass
+# =========================
+# Undervoltage monitor
+# =========================
+def parse_throttled_hex(s: str):
+    s = s.strip()
+    if "0x" not in s:
+        return None
+    try:
+        return int(s.split("0x")[1], 16)
+    except Exception:
+        return None
+
+
+def undervoltage_active(throttled_val: int) -> bool:
+    return (throttled_val & 0x1) != 0
+
+
+def temperature_thread():
+
+
+    while program_running:
+
+
+        try:
+            out = subprocess.check_output(
+                ["vcgencmd", "measure_temp"],
+                text=True
+            )
+
+
+            temp = float(out.replace("temp=", "").replace("'C", ""))
+
+
+            if temp > 80:
+                request_shutdown("CPU overheating")
+
+
+        except Exception:
+            pass
+
+
+        time.sleep(5)
+# =========================
+# Controller (buttons + shutdown)
+# =========================
+program_running = True
+shutdown_requested = False
+shutdown_reason = ""
+
+
+lock = threading.Lock()
+
+
+session = None
+is_recording = False
+is_stopped_yellow = False
+
+
+last_press_b1 = 0.0
+last_press_b2 = 0.0
+
+
+
+
+def request_shutdown(reason: str):
+    global shutdown_requested, shutdown_reason
+    with lock:
+        shutdown_requested = True
+        shutdown_reason = reason
+
+
+
+
+def safe_shutdown_sequence():
+    global session, is_recording
+    print(f"[SHUTDOWN] Requested: {shutdown_reason}")
+    blink_red(duration_s=2.0, period_s=0.2)
+    if is_recording and session is not None:
+        try:
+            session.stop()
+        except Exception:
+            pass
+        is_recording = False
+    try:
+        os.sync()
+    except Exception:
+        pass
+    leds_off()
+    GPIO.cleanup()
+    subprocess.call(["sudo", "shutdown", "-h", "now"])
+
+
+
+
+def undervoltage_thread():
+    while program_running:
+        try:
+            out = subprocess.check_output(["vcgencmd", "get_throttled"], text=True)
+            val = parse_throttled_hex(out)
+            if val is not None and undervoltage_active(val):
+                request_shutdown("UNDER-VOLTAGE detected (power sag)")
+                return
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+
+
+
+def sig_handler(sig, frame):
+    global program_running
+    program_running = False
+    request_shutdown("Signal received (Ctrl+C / SIGTERM)")
+
+
+
+
+def main():
+    global program_running, session, is_recording, is_stopped_yellow, last_press_b1, last_press_b2
+
+
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
+
+
+    gpio_init()
+    leds_all_on()
+    print("[BOOT] All LEDs ON. Button2 toggles record. Button1 shuts down safely.")
+
+
+    uv = threading.Thread(target=undervoltage_thread, daemon=True)
+    uv.start()
+
+
+    temp_thread = threading.Thread(target=temperature_thread, daemon=True)
+    temp_thread.start()
+
+
+    last_sync = time.monotonic()
+
+
+    try:
+        while program_running:
+            now = time.monotonic()
+
+
+            if is_recording and (now - last_sync) >= OS_SYNC_SEC:
+                try:
+                    os.sync()
+                except Exception:
+                    pass
+                last_sync = now
+
+
+            with lock:
+                if shutdown_requested:
+                    safe_shutdown_sequence()
+                    return
+
+
+            b1 = (GPIO.input(BTN_SHUTDOWN) == GPIO.LOW)
+            b2 = (GPIO.input(BTN_RECORD) == GPIO.LOW)
+
+
+            if b1 and (now - last_press_b1) >= DEBOUNCE_SEC:
+                last_press_b1 = now
+                request_shutdown("Button1 pressed (user shutdown)")
+
+
+            if b2 and (now - last_press_b2) >= DEBOUNCE_SEC:
+                last_press_b2 = now
+
+
+                if not is_recording and not is_stopped_yellow:
+                    session = AcquisitionSession()
+                    leds_recording()
+                    session.start()
+                    is_recording = True
+                    print("[STATE] RECORDING (green on).")
+
+
+                elif is_recording:
+                    try:
+                        session.stop()
+                    except Exception:
+                        pass
+                    is_recording = False
+                    is_stopped_yellow = True
+                    leds_stopped_yellow()
+                    print("[STATE] STOPPED (yellow latched until Button1).")
+
+
+                elif is_stopped_yellow:
+                    print("[STATE] Yellow latched. Button2 ignored until Button1 shutdown.")
+
+
+            time.sleep(0.02)
+
+
+    finally:
+        try:
+            if is_recording and session is not None:
+                session.stop()
+        except Exception:
+            pass
+        try:
+            os.sync()
+        except Exception:
+            pass
+        try:
+            leds_off()
+            GPIO.cleanup()
+        except Exception:
+            pass
+
+
+
+
+if __name__ == "__main__":
+    main()
+
