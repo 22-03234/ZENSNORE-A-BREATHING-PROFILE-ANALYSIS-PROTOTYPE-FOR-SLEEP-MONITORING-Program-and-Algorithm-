@@ -1,0 +1,701 @@
+clc;
+clear;
+close all;
+fprintf('\n============================================================\n');
+fprintf('   ZENSNORE MASTER SOUND PIPELINE (FINAL LOCKED VERSION)\n');
+fprintf('============================================================\n');
+%% ============================================================
+% 0. LOAD / MERGE AUDIO
+%% ============================================================
+fprintf('\n[STEP 0] LOADING / MERGING AUDIO FILE\n');
+singleFile = 'audio.wav';
+file1 = 'audio1.wav';
+file2 = 'audio2.wav';
+outFolder = 'sound_outputs';
+if ~exist(outFolder, 'dir')
+   mkdir(outFolder);
+end
+useMergedMode = isfile(file1) && isfile(file2);
+useSingleMode = isfile(singleFile);
+if useMergedMode
+   fprintf('Detected two-part audio recording: %s + %s\n', file1, file2);
+   [x1, fs1] = audioread(file1);
+   [x2, fs2] = audioread(file2);
+   if isempty(x1) || isempty(x2)
+       error('One of the audio part files is empty.');
+   end
+   if fs1 ~= fs2
+       error('Sampling rates of audio1.wav and audio2.wav do not match.');
+   end
+   if size(x1,2) ~= size(x2,2)
+       error('Channel mismatch between audio1.wav and audio2.wav.');
+   end
+   x = [x1; x2];
+   fs = fs1;
+   audiowrite(singleFile, x, fs);
+   inputFile = singleFile;
+   fprintf('Loaded %s                 : %d samples\n', file1, size(x1,1));
+   fprintf('Loaded %s                 : %d samples\n', file2, size(x2,1));
+   fprintf('Merged raw file saved as  : %s\n', inputFile);
+elseif useSingleMode
+   fprintf('Detected single audio recording: %s\n', singleFile);
+   [x, fs] = audioread(singleFile);
+   inputFile = singleFile;
+else
+   error('No audio input found. Provide either audio.wav or audio1.wav + audio2.wav');
+end
+if isempty(x)
+   error('Loaded audio signal is empty.');
+end
+if size(x,2) > 1
+   x = mean(x,2);
+   fprintf('Input audio converted to mono.\n');
+end
+x = double(x(:));
+N = length(x);
+duration_sec = N / fs;
+duration_min = duration_sec / 60;
+duration_hr  = duration_min / 60;
+fprintf('Input audio file            : %s\n', inputFile);
+fprintf('Sampling frequency          : %.2f Hz\n', fs);
+fprintf('Duration                    : %.2f s (%.2f min, %.2f hr)\n', ...
+   duration_sec, duration_min, duration_hr);
+%% ============================================================
+% 1. 1-SECOND WINDOW FEATURE EXTRACTION
+%% ============================================================
+fprintf('\n[STEP 1] 1-SECOND WINDOW FEATURE EXTRACTION\n');
+winSec = 1.0;
+samplesPerWin = round(winSec * fs);
+numWins = floor(N / samplesPerWin);
+window_id = (1:numWins)';
+start_time_s = zeros(numWins,1);
+end_time_s = zeros(numWins,1);
+rms_val = zeros(numWins,1);
+peak_freq_hz = nan(numWins,1);
+band_energy_ratio = nan(numWins,1);     % 65-300 / 20-2000 Hz
+zcr = nan(numWins,1);
+snore_band_power = nan(numWins,1);
+wide_band_power = nan(numWins,1);
+for k = 1:numWins
+   idx1 = (k-1)*samplesPerWin + 1;
+   idx2 = k*samplesPerWin;
+   seg = x(idx1:idx2);
+   seg = seg - mean(seg, 'omitnan');
+   start_time_s(k) = (idx1-1) / fs;
+   end_time_s(k)   = (idx2-1) / fs;
+   rms_val(k) = sqrt(mean(seg.^2, 'omitnan'));
+   zcr(k) = sum(abs(diff(seg > 0))) / (2*length(seg));
+   segw = seg .* hann(length(seg));
+   X = fft(segw);
+   mag = abs(X(1:floor(end/2)+1)).^2;
+   f = (0:length(mag)-1)' * fs / length(segw);
+   bandAll = f >= 20 & f <= 2000;
+   bandSnoreWide = f >= 65 & f <= 300;
+   wide_band_power(k) = sum(mag(bandAll), 'omitnan');
+   snore_band_power(k) = sum(mag(bandSnoreWide), 'omitnan');
+   if any(bandAll)
+       magAll = mag(bandAll);
+       fAll = f(bandAll);
+       [~, idxMax] = max(magAll);
+       peak_freq_hz(k) = fAll(idxMax);
+       eAll = sum(magAll, 'omitnan');
+       eSnoreWide = sum(mag(bandSnoreWide), 'omitnan');
+       if eAll > 0
+           band_energy_ratio(k) = eSnoreWide / eAll;
+       end
+   end
+end
+% ---------- placement-robust normalization ----------
+quietBaselineRMS = prctile(rms_val, 20);
+if quietBaselineRMS <= 0
+   quietBaselineRMS = median(rms_val(rms_val > 0), 'omitnan');
+end
+if isempty(quietBaselineRMS) || isnan(quietBaselineRMS) || quietBaselineRMS <= 0
+   quietBaselineRMS = eps;
+end
+rms_norm = rms_val ./ quietBaselineRMS;
+rms20 = prctile(rms_val, 20);
+rms50 = prctile(rms_val, 50);
+rms85 = prctile(rms_val, 85);
+rmsNorm50 = prctile(rms_norm, 50);
+rmsNorm75 = prctile(rms_norm, 75);
+rmsNorm85 = prctile(rms_norm, 85);
+rmsNorm95 = prctile(rms_norm, 95);
+SharedWindowTable = table( ...
+   window_id, start_time_s, end_time_s, rms_val, rms_norm, peak_freq_hz, ...
+   band_energy_ratio, zcr, snore_band_power, wide_band_power, ...
+   'VariableNames', {'window_id','start_time_s','end_time_s','rms','rms_norm', ...
+   'peak_freq_hz','band_energy_ratio','zcr','snore_band_power','wide_band_power'});
+writetable(SharedWindowTable, fullfile(outFolder, 'sound_window_features.csv'));
+fprintf('Total 1-s windows           : %d\n', numWins);
+fprintf('Adaptive RMS thresholds     : 20th=%.6f, 50th=%.6f, 85th=%.6f\n', rms20, rms50, rms85);
+fprintf('Normalized RMS thresholds   : 50th=%.2f, 75th=%.2f, 85th=%.2f, 95th=%.2f\n', ...
+   rmsNorm50, rmsNorm75, rmsNorm85, rmsNorm95);
+fprintf('Saved                       : %s\n', fullfile(outFolder, 'sound_window_features.csv'));
+%% ============================================================
+% 2. LAYER 1A - STRUCTURED SNORE DETECTION
+%% ============================================================
+fprintf('\n[STEP 2] LAYER 1A - STRUCTURED SNORE DETECTION\n');
+isCandidate = ...
+   (rms_val >= rms85) | ...
+   (rms_norm >= rmsNorm85 & band_energy_ratio >= 0.15);
+candIdx = find(isCandidate);
+starts = [];
+ends_ = [];
+if ~isempty(candIdx)
+   runStart = candIdx(1);
+   runEnd = candIdx(1);
+   for i = 2:length(candIdx)
+       if candIdx(i) == candIdx(i-1) + 1
+           runEnd = candIdx(i);
+       else
+           starts = [starts; runStart]; %#ok<AGROW>
+           ends_ = [ends_; runEnd]; %#ok<AGROW>
+           runStart = candIdx(i);
+           runEnd = candIdx(i);
+       end
+   end
+   starts = [starts; runStart];
+   ends_ = [ends_; runEnd];
+end
+numGroupedEvents = numel(starts);
+freqLow = 65.10;
+freqHigh = 184.00;
+durLow = 1.0;
+durHigh = 8.0;
+EventID = [];
+EventStart_s = [];
+EventEnd_s = [];
+EventDuration_s = [];
+MeanRMS = [];
+MeanRMSNorm = [];
+PeakFreq_Hz = [];
+BandEnergyRatio = [];
+SnoreStrength = strings(0,1);
+Label = strings(0,1);
+for i = 1:numGroupedEvents
+   sIdx = starts(i);
+   eIdx = ends_(i);
+   eventStart = start_time_s(sIdx);
+   eventEnd   = end_time_s(eIdx);
+   eventDur   = eventEnd - eventStart + 1/fs;
+   eventFreq = median(peak_freq_hz(sIdx:eIdx), 'omitnan');
+   eventRMS  = mean(rms_val(sIdx:eIdx), 'omitnan');
+   eventRMSNorm = mean(rms_norm(sIdx:eIdx), 'omitnan');
+   eventBER  = mean(band_energy_ratio(sIdx:eIdx), 'omitnan');
+   isSnore = ...
+       ~isnan(eventFreq) && ...
+       eventFreq >= freqLow && eventFreq <= freqHigh && ...
+       eventDur >= durLow && eventDur <= durHigh && ...
+       eventBER >= 0.12;
+   if isSnore
+       if eventRMSNorm >= rmsNorm95
+           strength = "StrongSnore";
+       elseif eventRMSNorm >= rmsNorm85
+           strength = "ModerateSnore";
+       else
+           strength = "SoftSnore";
+       end
+       EventID(end+1,1) = numel(EventID) + 1; %#ok<AGROW>
+       EventStart_s(end+1,1) = eventStart; %#ok<AGROW>
+       EventEnd_s(end+1,1) = eventEnd; %#ok<AGROW>
+       EventDuration_s(end+1,1) = eventDur; %#ok<AGROW>
+       MeanRMS(end+1,1) = eventRMS; %#ok<AGROW>
+       MeanRMSNorm(end+1,1) = eventRMSNorm; %#ok<AGROW>
+       PeakFreq_Hz(end+1,1) = eventFreq; %#ok<AGROW>
+       BandEnergyRatio(end+1,1) = eventBER; %#ok<AGROW>
+       SnoreStrength(end+1,1) = strength; %#ok<AGROW>
+       Label(end+1,1) = "SnoreLike"; %#ok<AGROW>
+   end
+end
+SnoreEventsTable = table( ...
+   EventID, EventStart_s, EventEnd_s, EventDuration_s, MeanRMS, MeanRMSNorm, ...
+   PeakFreq_Hz, BandEnergyRatio, SnoreStrength, Label);
+writetable(SnoreEventsTable, fullfile(outFolder, 'sound_snore_events.csv'));
+fprintf('Grouped candidate events    : %d\n', numGroupedEvents);
+fprintf('Snore events retained       : %d\n', height(SnoreEventsTable));
+fprintf('Snore freq band             : %.2f to %.2f Hz\n', freqLow, freqHigh);
+fprintf('Snore duration band         : %.2f to %.2f s\n', durLow, durHigh);
+fprintf('Saved                       : %s\n', fullfile(outFolder, 'sound_snore_events.csv'));
+%% ============================================================
+% 3. LAYER 1B - SUSTAINED NOISY BREATHING DETECTION
+%% ============================================================
+fprintf('\n[STEP 3] LAYER 1B - SUSTAINED NOISY BREATHING DETECTION\n');
+isNoisyBreathingWin = ...
+   rms_norm >= rmsNorm75 & ...
+   band_energy_ratio >= 0.12 & ...
+   peak_freq_hz >= 60 & peak_freq_hz <= 300;
+d_nb = diff([0; isNoisyBreathingWin(:); 0]);
+nbStarts = find(d_nb == 1);
+nbEnds   = find(d_nb == -1) - 1;
+nbLens   = nbEnds - nbStarts + 1;
+minNoisyBreathingSec = 4;
+NB_ID = [];
+NB_Start_s = [];
+NB_End_s = [];
+NB_Duration_s = [];
+NB_MeanRMSNorm = [];
+for i = 1:numel(nbStarts)
+   if nbLens(i) >= minNoisyBreathingSec
+       sIdx = nbStarts(i);
+       eIdx = nbEnds(i);
+       NB_ID(end+1,1) = numel(NB_ID) + 1; %#ok<AGROW>
+       NB_Start_s(end+1,1) = start_time_s(sIdx); %#ok<AGROW>
+       NB_End_s(end+1,1) = end_time_s(eIdx); %#ok<AGROW>
+       NB_Duration_s(end+1,1) = end_time_s(eIdx) - start_time_s(sIdx) + winSec; %#ok<AGROW>
+       NB_MeanRMSNorm(end+1,1) = mean(rms_norm(sIdx:eIdx), 'omitnan'); %#ok<AGROW>
+   end
+end
+NoisyBreathingTable = table( ...
+   NB_ID, NB_Start_s, NB_End_s, NB_Duration_s, NB_MeanRMSNorm, ...
+   'VariableNames', {'NoisyBreathingID','Start_s','End_s','Duration_s','MeanRMSNorm'});
+writetable(NoisyBreathingTable, fullfile(outFolder, 'sound_noisy_breathing_events.csv'));
+fprintf('Noisy breathing segments    : %d\n', height(NoisyBreathingTable));
+fprintf('Saved                       : %s\n', fullfile(outFolder, 'sound_noisy_breathing_events.csv'));
+%% ============================================================
+% 4. 30-SECOND EPOCH ACOUSTIC BURDEN + CLASSIFICATION
+%% ============================================================
+fprintf('\n[STEP 4] 30-SECOND EPOCH ACOUSTIC BURDEN + CLASSIFICATION\n');
+epochSec = 30;
+numEpochs = floor(duration_sec / epochSec);
+Epoch = (1:numEpochs)';
+EpochStart_s = (Epoch-1) * epochSec;
+EpochEnd_s = Epoch * epochSec;
+snore_count = zeros(numEpochs,1);
+snore_duration = zeros(numEpochs,1);
+soft_snore_count = zeros(numEpochs,1);
+moderate_snore_count = zeros(numEpochs,1);
+strong_snore_count = zeros(numEpochs,1);
+noisy_breathing_duration = zeros(numEpochs,1);
+snore_like_window_count = zeros(numEpochs,1);
+snore_burden_pct = zeros(numEpochs,1);
+acoustic_severity = strings(numEpochs,1);
+label = strings(numEpochs,1);
+for e = 1:numEpochs
+   epStart = EpochStart_s(e);
+   epEnd   = EpochEnd_s(e);
+   winMask = start_time_s >= epStart & start_time_s < epEnd;
+   snoreLikeWinMask = ...
+       winMask & ...
+       peak_freq_hz >= 65 & peak_freq_hz <= 300 & ...
+       band_energy_ratio >= 0.12 & ...
+       rms_norm >= rmsNorm75;
+   snore_like_window_count(e) = sum(snoreLikeWinMask);
+   snore_burden_pct(e) = 100 * sum(snoreLikeWinMask) / max(sum(winMask),1);
+   count = 0;
+   dur = 0;
+   sCount = 0;
+   mCount = 0;
+   hCount = 0;
+   for i = 1:height(SnoreEventsTable)
+       evStart = SnoreEventsTable.EventStart_s(i);
+       evEnd   = SnoreEventsTable.EventEnd_s(i);
+       overlapStart = max(epStart, evStart);
+       overlapEnd   = min(epEnd, evEnd);
+       if overlapStart < overlapEnd
+           count = count + 1;
+           dur = dur + (overlapEnd - overlapStart);
+           if SnoreEventsTable.SnoreStrength(i) == "SoftSnore"
+               sCount = sCount + 1;
+           elseif SnoreEventsTable.SnoreStrength(i) == "ModerateSnore"
+               mCount = mCount + 1;
+           elseif SnoreEventsTable.SnoreStrength(i) == "StrongSnore"
+               hCount = hCount + 1;
+           end
+       end
+   end
+   ndur = 0;
+   for i = 1:height(NoisyBreathingTable)
+       evStart = NoisyBreathingTable.Start_s(i);
+       evEnd   = NoisyBreathingTable.End_s(i);
+       overlapStart = max(epStart, evStart);
+       overlapEnd   = min(epEnd, evEnd);
+       if overlapStart < overlapEnd
+           ndur = ndur + (overlapEnd - overlapStart);
+       end
+   end
+   snore_count(e) = count;
+   snore_duration(e) = dur;
+   soft_snore_count(e) = sCount;
+   moderate_snore_count(e) = mCount;
+   strong_snore_count(e) = hCount;
+   noisy_breathing_duration(e) = ndur;
+   if strong_snore_count(e) >= 2 || snore_duration(e) >= 10 || ...
+           noisy_breathing_duration(e) >= 12 || snore_burden_pct(e) >= 40
+       acoustic_severity(e) = "HeavySnoring";
+   elseif moderate_snore_count(e) >= 1 || snore_duration(e) >= 4 || ...
+           noisy_breathing_duration(e) >= 6 || snore_burden_pct(e) >= 20
+       acoustic_severity(e) = "ModerateSnoring";
+   elseif soft_snore_count(e) >= 1 || snore_burden_pct(e) >= 8
+       acoustic_severity(e) = "SoftSnoring";
+   else
+       acoustic_severity(e) = "Normal";
+   end
+   label(e) = acoustic_severity(e);
+end
+SnoreEpochTable = table( ...
+   Epoch, EpochStart_s, EpochEnd_s, ...
+   snore_count, soft_snore_count, moderate_snore_count, strong_snore_count, ...
+   snore_duration, noisy_breathing_duration, snore_like_window_count, ...
+   snore_burden_pct, acoustic_severity, label, ...
+   'VariableNames', {'epoch','epoch_start','epoch_end', ...
+   'snore_count','soft_snore_count','moderate_snore_count','strong_snore_count', ...
+   'snore_duration','noisy_breathing_duration','snore_like_window_count', ...
+   'snore_burden_pct','acoustic_severity','label'});
+writetable(SnoreEpochTable, fullfile(outFolder, 'sound_epoch_classification.csv'));
+nHeavy = sum(acoustic_severity == "HeavySnoring");
+nModerate = sum(acoustic_severity == "ModerateSnoring");
+nSoft = sum(acoustic_severity == "SoftSnoring");
+nNormal = sum(acoustic_severity == "Normal");
+fprintf('Total epochs                : %d\n', numEpochs);
+fprintf('Normal epochs               : %d\n', nNormal);
+fprintf('Soft snoring epochs         : %d\n', nSoft);
+fprintf('Moderate snoring epochs     : %d\n', nModerate);
+fprintf('Heavy snoring epochs        : %d\n', nHeavy);
+fprintf('Any snoring epochs          : %d (%.2f%%)\n', ...
+   nSoft+nModerate+nHeavy, 100*(nSoft+nModerate+nHeavy)/numEpochs);
+fprintf('Saved                       : %s\n', fullfile(outFolder, 'sound_epoch_classification.csv'));
+%% ============================================================
+% 5. SNORE CLUSTER ANALYSIS
+%% ============================================================
+fprintf('\n[STEP 5] SNORE CLUSTER ANALYSIS\n');
+clusterGapSec = 10;
+if height(SnoreEventsTable) == 0
+   ClusterID = [];
+   ClusterStart_s = [];
+   ClusterEnd_s = [];
+   ClusterDuration_s = [];
+   EventsPerCluster = [];
+else
+   clusterStart = SnoreEventsTable.EventStart_s(1);
+   clusterEnd = SnoreEventsTable.EventEnd_s(1);
+   countInCluster = 1;
+   ClusterID = [];
+   ClusterStart_s = [];
+   ClusterEnd_s = [];
+   ClusterDuration_s = [];
+   EventsPerCluster = [];
+   cid = 1;
+   for i = 2:height(SnoreEventsTable)
+       currStart = SnoreEventsTable.EventStart_s(i);
+       currEnd   = SnoreEventsTable.EventEnd_s(i);
+       prevEnd   = SnoreEventsTable.EventEnd_s(i-1);
+       if (currStart - prevEnd) <= clusterGapSec
+           clusterEnd = currEnd;
+           countInCluster = countInCluster + 1;
+       else
+           ClusterID(end+1,1) = cid; %#ok<AGROW>
+           ClusterStart_s(end+1,1) = clusterStart; %#ok<AGROW>
+           ClusterEnd_s(end+1,1) = clusterEnd; %#ok<AGROW>
+           ClusterDuration_s(end+1,1) = clusterEnd - clusterStart; %#ok<AGROW>
+           EventsPerCluster(end+1,1) = countInCluster; %#ok<AGROW>
+           cid = cid + 1;
+           clusterStart = currStart;
+           clusterEnd = currEnd;
+           countInCluster = 1;
+       end
+   end
+   ClusterID(end+1,1) = cid;
+   ClusterStart_s(end+1,1) = clusterStart;
+   ClusterEnd_s(end+1,1) = clusterEnd;
+   ClusterDuration_s(end+1,1) = clusterEnd - clusterStart;
+   EventsPerCluster(end+1,1) = countInCluster;
+end
+ClusterTable = table( ...
+   ClusterID, ClusterStart_s, ClusterEnd_s, ClusterDuration_s, EventsPerCluster);
+writetable(ClusterTable, fullfile(outFolder, 'sound_cluster_summary.csv'));
+fprintf('Total clusters              : %d\n', height(ClusterTable));
+fprintf('Clusters per hour           : %.2f\n', height(ClusterTable)/duration_hr);
+if height(ClusterTable) > 0
+   fprintf('Mean cluster duration       : %.2f s\n', mean(ClusterDuration_s, 'omitnan'));
+   fprintf('Median cluster duration     : %.2f s\n', median(ClusterDuration_s, 'omitnan'));
+   fprintf('Mean events per cluster     : %.2f\n', mean(EventsPerCluster, 'omitnan'));
+else
+   fprintf('Mean cluster duration       : N/A\n');
+   fprintf('Median cluster duration     : N/A\n');
+   fprintf('Mean events per cluster     : N/A\n');
+end
+fprintf('Saved                       : %s\n', fullfile(outFolder, 'sound_cluster_summary.csv'));
+%% ============================================================
+% 6. LAYER 2 - APNEA-LIKE ACOUSTIC FLAGGING
+%% ============================================================
+fprintf('\n[STEP 6] LAYER 2 - APNEA-LIKE ACOUSTIC FLAGGING\n');
+isSnoreLikeWin = ...
+   peak_freq_hz >= 65 & peak_freq_hz <= 184 & ...
+   band_energy_ratio >= 0.12 & ...
+   rms_norm >= rmsNorm75;
+isQuietWin = rms_val <= rms20;
+isRecoveryLikeWin = ...
+   rms_norm >= rmsNorm50 & ...
+   ( ...
+     (peak_freq_hz >= 80 & peak_freq_hz <= 500) | ...
+     (band_energy_ratio >= 0.20) ...
+   );
+minQuietSec = 8;
+maxRecoveryLagSec = 6;
+preSnoreLookbackSec = 12;
+d = diff([0; isQuietWin(:); 0]);
+quietStarts = find(d == 1);
+quietEnds   = find(d == -1) - 1;
+quietLens   = quietEnds - quietStarts + 1;
+validQuietIdx = find(quietLens >= minQuietSec);
+AEventID = [];
+QuietStart_s = [];
+QuietEnd_s = [];
+QuietDuration_s = [];
+PreSnoreCount = [];
+RecoveryWindow = [];
+RecoveryType = strings(0,1);
+EventLabel = strings(0,1);
+for ii = 1:numel(validQuietIdx)
+   qIdx = validQuietIdx(ii);
+   qStart = quietStarts(qIdx);
+   qEnd   = quietEnds(qIdx);
+   qStart_s = start_time_s(qStart);
+   qEnd_s   = end_time_s(qEnd);
+   qDur_s   = qEnd_s - qStart_s + winSec;
+   preStart = max(1, qStart - preSnoreLookbackSec);
+   preEnd   = qStart - 1;
+   if preEnd < preStart
+       preCount = 0;
+   else
+       preCount = sum(isSnoreLikeWin(preStart:preEnd));
+   end
+   recStart = qEnd + 1;
+   recEnd   = min(numWins, qEnd + maxRecoveryLagSec);
+   hasRecovery = false;
+   recType = "None";
+   recWindow = NaN;
+   if recStart <= recEnd
+       for r = recStart:recEnd
+           if isRecoveryLikeWin(r)
+               hasRecovery = true;
+               recWindow = r;
+               if isSnoreLikeWin(r)
+                   recType = "RecoverySnore";
+               else
+                   recType = "RecoveryBreathOrGaspLike";
+               end
+               break;
+           end
+       end
+   end
+   if preCount >= 1 && hasRecovery
+       AEventID(end+1,1) = numel(AEventID) + 1; %#ok<AGROW>
+       QuietStart_s(end+1,1) = qStart_s; %#ok<AGROW>
+       QuietEnd_s(end+1,1) = qEnd_s; %#ok<AGROW>
+       QuietDuration_s(end+1,1) = qDur_s; %#ok<AGROW>
+       PreSnoreCount(end+1,1) = preCount; %#ok<AGROW>
+       RecoveryWindow(end+1,1) = recWindow; %#ok<AGROW>
+       RecoveryType(end+1,1) = recType; %#ok<AGROW>
+       if qDur_s >= 10
+           EventLabel(end+1,1) = "ApneaLike_AcousticSequence"; %#ok<AGROW>
+       else
+           EventLabel(end+1,1) = "HypopneaLike_AcousticSequence"; %#ok<AGROW>
+       end
+   end
+end
+if isempty(AEventID)
+   ApneaLikeTable = table;
+else
+   RecoveryTime_s = start_time_s(RecoveryWindow);
+   ApneaLikeTable = table( ...
+       AEventID, QuietStart_s, QuietEnd_s, QuietDuration_s, ...
+       PreSnoreCount, RecoveryWindow, RecoveryTime_s, RecoveryType, EventLabel);
+end
+writetable(ApneaLikeTable, fullfile(outFolder, 'sound_apnealike_events.csv'));
+fprintf('Quiet runs >= %.0f s found  : %d\n', minQuietSec, numel(validQuietIdx));
+fprintf('Flagged apnea-like events   : %d\n', height(ApneaLikeTable));
+fprintf('Saved                       : %s\n', fullfile(outFolder, 'sound_apnealike_events.csv'));
+%% ============================================================
+% 7. MAP APNEA-LIKE FLAGS TO 30-S EPOCHS
+%% ============================================================
+fprintf('\n[STEP 7] MAPPING APNEA-LIKE FLAGS TO 30-S EPOCHS\n');
+HasApneaLikeSound = false(numEpochs,1);
+NumApneaLikeEvents = zeros(numEpochs,1);
+ApneaLikeOverlap_s = zeros(numEpochs,1);
+if ~isempty(AEventID)
+   for e = 1:numEpochs
+       epStart = EpochStart_s(e);
+       epEnd   = EpochEnd_s(e);
+       count = 0;
+       overlapDur = 0;
+       for i = 1:height(ApneaLikeTable)
+           evStart = ApneaLikeTable.QuietStart_s(i);
+           evEnd   = ApneaLikeTable.QuietEnd_s(i);
+           overlapStart = max(epStart, evStart);
+           overlapEnd   = min(epEnd, evEnd);
+           if overlapStart < overlapEnd
+               count = count + 1;
+               overlapDur = overlapDur + (overlapEnd - overlapStart);
+           end
+       end
+       HasApneaLikeSound(e) = count > 0;
+       NumApneaLikeEvents(e) = count;
+       ApneaLikeOverlap_s(e) = overlapDur;
+   end
+end
+ApneaLikeEpochTable = table( ...
+   Epoch, EpochStart_s, EpochEnd_s, ...
+   HasApneaLikeSound, NumApneaLikeEvents, ApneaLikeOverlap_s);
+writetable(ApneaLikeEpochTable, fullfile(outFolder, 'sound_apnealike_epoch_flags.csv'));
+fprintf('Epochs with flagged sound   : %d (%.2f%%)\n', ...
+   sum(HasApneaLikeSound), 100*sum(HasApneaLikeSound)/numEpochs);
+fprintf('Saved                       : %s\n', fullfile(outFolder, 'sound_apnealike_epoch_flags.csv'));
+%% ============================================================
+% 8. FINAL LOCKED EPOCH CLASSIFICATION UPGRADE
+%% ============================================================
+fprintf('\n[STEP 8] FINAL LOCKED EPOCH CLASSIFICATION UPGRADE\n');
+T = SnoreEpochTable;
+% ---------- Final frozen thresholds ----------
+BURDEN_SOFT_MIN      = 10;
+BURDEN_MODERATE_MIN  = 30;
+BURDEN_HEAVY_MIN     = 60;
+HEAVY_STRONGCOUNT_MIN       = 1;
+MODERATE_MODCOUNT_MIN       = 1;
+NOISY_BREATH_HEAVY_SEC      = 10;
+NOISY_BREATH_MODERATE_SEC   = 5;
+APNEA_SUPPORT_BURDEN_MIN    = 40;
+APNEA_SUPPORT_STRONG_MIN    = 2;
+APNEA_SUPPORT_NOISY_SEC     = 8;
+EpochCol           = T.epoch;
+EpochStartCol      = T.epoch_start;
+EpochEndCol        = T.epoch_end;
+SnoreCount         = T.snore_count;
+SoftCount          = T.soft_snore_count;
+ModerateCount      = T.moderate_snore_count;
+StrongCount        = T.strong_snore_count;
+SnoreDuration_s    = T.snore_duration;
+NoisyBreathDur     = T.noisy_breathing_duration;
+EventCount         = T.snore_like_window_count;
+SnoreBurden_pct    = T.snore_burden_pct;
+AcousticSeverity   = string(T.acoustic_severity);
+OriginalLabel      = string(T.label);
+FinalSnoreSeverity = strings(height(T),1);
+for i = 1:height(T)
+   b = SnoreBurden_pct(i);
+   if isnan(b)
+       FinalSnoreSeverity(i) = "Normal";
+   elseif b < BURDEN_SOFT_MIN
+       FinalSnoreSeverity(i) = "Normal";
+   elseif b < BURDEN_MODERATE_MIN
+       FinalSnoreSeverity(i) = "SoftSnoring";
+   elseif b < BURDEN_HEAVY_MIN
+       FinalSnoreSeverity(i) = "ModerateSnoring";
+   else
+       FinalSnoreSeverity(i) = "HeavySnoring";
+   end
+end
+for i = 1:height(T)
+   currentClass = FinalSnoreSeverity(i);
+   heavyByCounts = StrongCount(i) >= HEAVY_STRONGCOUNT_MIN;
+   heavyByNoisy  = NoisyBreathDur(i) >= NOISY_BREATH_HEAVY_SEC;
+   heavyByText   = strcmpi(AcousticSeverity(i), "HeavySnoring") || strcmpi(AcousticSeverity(i), "Heavy");
+   if currentClass ~= "HeavySnoring"
+       if (heavyByCounts || heavyByNoisy || heavyByText) && SnoreBurden_pct(i) >= BURDEN_MODERATE_MIN
+           FinalSnoreSeverity(i) = "HeavySnoring";
+           continue;
+       end
+   end
+   moderateByCounts = ModerateCount(i) >= MODERATE_MODCOUNT_MIN;
+   moderateByNoisy  = NoisyBreathDur(i) >= NOISY_BREATH_MODERATE_SEC;
+   moderateByText   = strcmpi(AcousticSeverity(i), "ModerateSnoring") || strcmpi(AcousticSeverity(i), "Moderate");
+   if currentClass == "Normal" || currentClass == "SoftSnoring"
+       if (moderateByCounts || moderateByNoisy || moderateByText) && SnoreBurden_pct(i) >= BURDEN_SOFT_MIN
+           FinalSnoreSeverity(i) = "ModerateSnoring";
+           continue;
+       end
+   end
+   softByCounts = SoftCount(i) > 0 || SnoreCount(i) > 0 || EventCount(i) > 0;
+   softByText   = strcmpi(AcousticSeverity(i), "SoftSnoring") || strcmpi(AcousticSeverity(i), "Snoring");
+   if currentClass == "Normal"
+       if (softByCounts || softByText) && SnoreBurden_pct(i) >= BURDEN_SOFT_MIN
+           FinalSnoreSeverity(i) = "SoftSnoring";
+       end
+   end
+end
+IsSnoring = FinalSnoreSeverity ~= "Normal";
+FinalSoundClassBinary = strings(height(T),1);
+FinalSoundClassBinary(~IsSnoring) = "Normal";
+FinalSoundClassBinary(IsSnoring)  = "Snoring";
+PossibleApneaSupport = false(height(T),1);
+for i = 1:height(T)
+   severeBurden = SnoreBurden_pct(i) >= APNEA_SUPPORT_BURDEN_MIN;
+   strongEvents = StrongCount(i) >= APNEA_SUPPORT_STRONG_MIN;
+   noisySupport = NoisyBreathDur(i) >= APNEA_SUPPORT_NOISY_SEC;
+   heavyClass   = FinalSnoreSeverity(i) == "HeavySnoring";
+   soundApneaLike = HasApneaLikeSound(i);
+   if (severeBurden && (strongEvents || noisySupport || heavyClass)) || soundApneaLike
+       PossibleApneaSupport(i) = true;
+   end
+end
+PassedSoftThreshold        = SnoreBurden_pct >= BURDEN_SOFT_MIN;
+PassedModerateThreshold    = SnoreBurden_pct >= BURDEN_MODERATE_MIN;
+PassedHeavyThreshold       = SnoreBurden_pct >= BURDEN_HEAVY_MIN;
+FinalOut = table();
+FinalOut.Epoch                    = EpochCol;
+FinalOut.StartTime_s              = EpochStartCol;
+FinalOut.EndTime_s                = EpochEndCol;
+FinalOut.EpochDuration_s          = EpochEndCol - EpochStartCol;
+FinalOut.SnoreCount               = SnoreCount;
+FinalOut.SnoreDuration_sec        = SnoreDuration_s;
+FinalOut.SnoreLikeWindowCount     = EventCount;
+FinalOut.SnoreBurden_pct          = SnoreBurden_pct;
+FinalOut.SoftSnoreCount           = SoftCount;
+FinalOut.ModerateSnoreCount       = ModerateCount;
+FinalOut.StrongSnoreCount         = StrongCount;
+FinalOut.NoisyBreathingDuration_s = NoisyBreathDur;
+FinalOut.AcousticSeverity         = AcousticSeverity;
+FinalOut.OriginalLabel            = OriginalLabel;
+FinalOut.HasApneaLikeSound        = HasApneaLikeSound;
+FinalOut.NumApneaLikeEvents       = NumApneaLikeEvents;
+FinalOut.ApneaLikeOverlap_s       = ApneaLikeOverlap_s;
+FinalOut.PassedSoftThreshold      = PassedSoftThreshold;
+FinalOut.PassedModerateThreshold  = PassedModerateThreshold;
+FinalOut.PassedHeavyThreshold     = PassedHeavyThreshold;
+FinalOut.FinalSnoreSeverity       = FinalSnoreSeverity;
+FinalOut.FinalSoundClassBinary    = FinalSoundClassBinary;
+FinalOut.IsSnoring                = IsSnoring;
+FinalOut.PossibleApneaSupport     = PossibleApneaSupport;
+writetable(FinalOut, fullfile(outFolder, 'sound_epoch_final_classification.csv'));
+fprintf('Rows saved                  : %d\n', height(FinalOut));
+fprintf('Saved                       : %s\n', fullfile(outFolder, 'sound_epoch_final_classification.csv'));
+%% ============================================================
+% 9. FINAL NIGHT-LEVEL SUMMARY
+%% ============================================================
+fprintf('\n============================================================\n');
+fprintf('          FINAL LOCKED SOUND SUMMARY\n');
+fprintf('============================================================\n');
+nEpochs = height(FinalOut);
+pctSoft     = 100 * mean(FinalOut.FinalSnoreSeverity == "SoftSnoring");
+pctModerate = 100 * mean(FinalOut.FinalSnoreSeverity == "ModerateSnoring");
+pctHeavy    = 100 * mean(FinalOut.FinalSnoreSeverity == "HeavySnoring");
+pctSnoring  = 100 * mean(FinalOut.IsSnoring);
+pctApneaSup = 100 * mean(FinalOut.PossibleApneaSupport);
+if pctHeavy >= 10 || pctSnoring >= 60
+   FinalNightSoundLabel = "HeavySnoring";
+elseif pctModerate >= 20 || pctSnoring >= 30
+   FinalNightSoundLabel = "ModerateSnoring";
+elseif pctSnoring >= 10
+   FinalNightSoundLabel = "SoftSnoring";
+else
+   FinalNightSoundLabel = "Normal";
+end
+fprintf('\n================ FINAL SOUND SUMMARY ================\n');
+disp(groupsummary(FinalOut, 'FinalSnoreSeverity'));
+fprintf('\n================ BINARY SUMMARY ================\n');
+disp(groupsummary(FinalOut, 'FinalSoundClassBinary'));
+fprintf('\n================ APNEA SUPPORT SUMMARY ================\n');
+fprintf('Epochs with apnea support   : %d / %d (%.2f%%)\n', ...
+   sum(FinalOut.PossibleApneaSupport), nEpochs, pctApneaSup);
+fprintf('\n================ NIGHT-LEVEL SUMMARY ================\n');
+fprintf('Night sound label           : %s\n', FinalNightSoundLabel);
+fprintf('Any snoring epochs          : %.2f %%\n', pctSnoring);
+fprintf('Soft snoring epochs         : %.2f %%\n', pctSoft);
+fprintf('Moderate snoring epochs     : %.2f %%\n', pctModerate);
+fprintf('Heavy snoring epochs        : %.2f %%\n', pctHeavy);
+fprintf('\nOutput folder               : %s\n', outFolder);
+fprintf('============================================================\n');
+fprintf('        PIPELINE COMPLETE\n');
+fprintf('============================================================\n');
+
