@@ -1,0 +1,1039 @@
+%% ============================================================
+%  ZENSNORE FINAL MULTIMODAL FUSION + INTERPRETATION + GRAPHS
+%  LOCKED VERSION (STRICT VALIDATORS + 3-MIN RELEVANT WINDOW)
+%
+%  FINAL MAIN LABELS:
+%     Normal
+%     Snoring
+%     SuspectedApnea
+%
+%  ALSO PRESERVES:
+%     - Airflow detail
+%     - Sound detail
+%     - SpO2 detail
+%     - HR detail
+%     - Per-epoch detailed fusion tag
+%     - Night-level interpretation
+%
+%  OUTPUTS:
+%     fusion_outputs/zensnore_fused_epoch_table.csv
+%     fusion_outputs/zensnore_night_summary.csv
+%     fusion_outputs/zensnore_most_relevant_window.csv
+%     fusion_outputs/fusion_relevant_window_overview.png
+%     fusion_outputs/fusion_relevant_window_airflow.png
+%     fusion_outputs/fusion_relevant_window_sound.png
+%     fusion_outputs/fusion_relevant_window_spo2.png
+%     fusion_outputs/fusion_relevant_window_hr.png
+%% ============================================================
+clc;
+clear;
+close all;
+fprintf('\n============================================================\n');
+fprintf(' ZENSNORE FINAL MULTIMODAL FUSION + INTERPRETATION + GRAPHS\n');
+fprintf('============================================================\n');
+%% ------------------------------------------------------------
+% SETTINGS
+%% ------------------------------------------------------------
+epochLen_sec = 30;
+zoomWin_sec  = 180;   % 3 minutes
+minFinalQualityToTrust = 0.50; %#ok<NASGU>  % reserved for future extension
+% Input files
+airflowEpochFile = fullfile(pwd,'airflow_outputs','airflow_epoch_final_classification.csv');
+airflowTraceFile = fullfile(pwd,'airflow_outputs','airflow_signal_trace.csv');
+soundEpochFile   = fullfile(pwd,'sound_outputs','sound_epoch_final_classification.csv');
+soundWindowFile  = fullfile(pwd,'sound_outputs','sound_window_features.csv');
+spo2FinalFile    = fullfile(pwd,'spo2_outputs','spo2_epoch_final_classification.csv');
+spo2CtxFile      = fullfile(pwd,'spo2_outputs','spo2_contextual_epoch_flags.csv');
+spo2RawFile      = fullfile(pwd,'spo2_outputs','spo2_recomputed_from_raw.csv');
+spo2CleanFile    = fullfile(pwd,'spo2_outputs','spo2_final_artifact_rejected.csv');
+hrEpochFile      = fullfile(pwd,'hr_outputs','hr_epoch_classification.csv');
+hrCtxFile        = fullfile(pwd,'hr_outputs','hr_contextual_epoch_flags.csv');
+hrProcFile       = fullfile(pwd,'hr_outputs','ppg_hr_processed.csv');
+hrTraceFile      = fullfile(pwd,'hr_outputs','ppg_hr_trace.csv');
+rawAirflowFile   = fullfile(pwd,'airflow.csv');
+rawPPGFile       = fullfile(pwd,'ppg.csv');
+rawAudioFile     = fullfile(pwd,'audio.wav');
+rawAudio1File    = fullfile(pwd,'audio1.wav');
+rawAudio2File    = fullfile(pwd,'audio2.wav');
+outDir = fullfile(pwd,'fusion_outputs');
+if ~exist(outDir,'dir')
+   mkdir(outDir);
+end
+%% ------------------------------------------------------------
+% CHECK REQUIRED FILES
+%% ------------------------------------------------------------
+requiredFiles = {airflowEpochFile, soundEpochFile, spo2FinalFile, hrEpochFile, hrCtxFile};
+for i = 1:numel(requiredFiles)
+   if ~isfile(requiredFiles{i})
+       error('Required file not found: %s', requiredFiles{i});
+   end
+end
+%% ------------------------------------------------------------
+% LOAD TABLES
+%% ------------------------------------------------------------
+A  = readtable(airflowEpochFile);
+S  = readtable(soundEpochFile);
+O  = readtable(spo2FinalFile);
+H  = readtable(hrEpochFile);
+HC = readtable(hrCtxFile);
+if isfile(spo2CtxFile)
+   OC = readtable(spo2CtxFile);
+else
+   OC = table();
+end
+fprintf('\nRows loaded:\n');
+fprintf(' Airflow : %d\n', height(A));
+fprintf(' Sound   : %d\n', height(S));
+fprintf(' SpO2    : %d\n', height(O));
+fprintf(' HR      : %d\n', height(H));
+fprintf(' HR ctx  : %d\n', height(HC));
+%% ------------------------------------------------------------
+% STANDARDIZE AIRFLOW TABLE
+%% ------------------------------------------------------------
+TA = table();
+TA.Epoch = getNumericCol(A, {'Epoch'});
+TA.StartTime_s = getNumericColOrDefault(A, {'StartTime_s','EpochStart_sec'}, (TA.Epoch-1)*epochLen_sec);
+TA.EndTime_s   = getNumericColOrDefault(A, {'EndTime_s','EpochEnd_sec'}, TA.StartTime_s + epochLen_sec);
+TA.AirflowClass = getStringCol(A, {'FinalClass','Class'}, "Unknown");
+TA.AirflowReason = getStringCol(A, {'Reason'}, "");
+TA.AirflowHasApneaEvent = getLogicalColOrDefault(A, {'HasApneaEvent'}, false(height(A),1));
+TA.AirflowNumApneaEvents = getNumericColOrDefault(A, {'NumApneaEvents'}, zeros(height(A),1));
+TA.AirflowApneaOverlap_s = getNumericColOrDefault(A, {'ApneaOverlap_s'}, zeros(height(A),1));
+TA.RMS_kPa            = getNumericColOrDefault(A, {'RMS_kPa'}, nan(height(A),1));
+TA.LocalRange_kPa     = getNumericColOrDefault(A, {'LocalRange_kPa'}, nan(height(A),1));
+TA.EnvelopeMean_kPa   = getNumericColOrDefault(A, {'EnvelopeMean_kPa'}, nan(height(A),1));
+TA.RespiratoryRate_bpm = getNumericColOrDefault(A, {'RespiratoryRate_bpm'}, nan(height(A),1));
+TA.AirflowHasFlowReduced = TA.AirflowClass == "FlowReduced";
+TA.AirflowHasApneaLike   = TA.AirflowClass == "ApneaLike" | TA.AirflowHasApneaEvent;
+%% ------------------------------------------------------------
+% STANDARDIZE SOUND TABLE
+%% ------------------------------------------------------------
+TS = table();
+TS.Epoch = getNumericCol(S, {'Epoch','epoch'});
+TS.StartTime_s = getNumericColOrDefault(S, {'StartTime_s','epoch_start'}, (TS.Epoch-1)*epochLen_sec);
+TS.EndTime_s   = getNumericColOrDefault(S, {'EndTime_s','epoch_end'}, TS.StartTime_s + epochLen_sec);
+TS.FinalSnoreSeverity = getStringCol(S, {'FinalSnoreSeverity','AcousticSeverity','label'}, "Normal");
+TS.FinalSoundBinary   = getStringCol(S, {'FinalSoundClassBinary','label'}, "Normal");
+TS.SnoreCount            = getNumericColOrDefault(S, {'SnoreCount'}, zeros(height(S),1));
+TS.SnoreDuration_sec     = getNumericColOrDefault(S, {'SnoreDuration_sec'}, zeros(height(S),1));
+TS.SnoreBurden_pct       = getNumericColOrDefault(S, {'SnoreBurden_pct'}, zeros(height(S),1));
+TS.SoftSnoreCount        = getNumericColOrDefault(S, {'SoftSnoreCount'}, zeros(height(S),1));
+TS.ModerateSnoreCount    = getNumericColOrDefault(S, {'ModerateSnoreCount'}, zeros(height(S),1));
+TS.StrongSnoreCount      = getNumericColOrDefault(S, {'StrongSnoreCount'}, zeros(height(S),1));
+TS.NoisyBreathingDuration_s = getNumericColOrDefault(S, {'NoisyBreathingDuration_s'}, zeros(height(S),1));
+TS.SoundHasSnore = getLogicalColOrDefault(S, {'IsSnoring'}, TS.FinalSoundBinary == "Snoring");
+TS.SoundHasApneaLike = getLogicalColOrDefault(S, {'HasApneaLikeSound'}, false(height(S),1));
+TS.NumApneaLikeEvents = getNumericColOrDefault(S, {'NumApneaLikeEvents'}, zeros(height(S),1));
+TS.ApneaLikeOverlap_s = getNumericColOrDefault(S, {'ApneaLikeOverlap_s'}, zeros(height(S),1));
+TS.PossibleApneaSupport = getLogicalColOrDefault(S, {'PossibleApneaSupport'}, false(height(S),1));
+%% ------------------------------------------------------------
+% STANDARDIZE SpO2 TABLE
+%% ------------------------------------------------------------
+TO = table();
+TO.Epoch = getNumericCol(O, {'EpochNumber','Epoch'});
+TO.StartTime_s = getNumericColOrDefault(O, {'EpochStart_sec','StartTime_s'}, (TO.Epoch-1)*epochLen_sec);
+TO.EndTime_s   = getNumericColOrDefault(O, {'EpochEnd_sec','EndTime_s'}, TO.StartTime_s + epochLen_sec);
+TO.MeanSpO2 = getNumericColOrDefault(O, {'MeanSpO2'}, nan(height(O),1));
+TO.MinSpO2  = getNumericColOrDefault(O, {'MinSpO2'}, nan(height(O),1));
+TO.DropMagnitude = getNumericColOrDefault(O, {'DropMagnitude'}, nan(height(O),1));
+TO.DesatDuration_sec = getNumericColOrDefault(O, {'DesatDuration_sec'}, zeros(height(O),1));
+TO.ValidFraction = getNumericColOrDefault(O, {'ValidFraction'}, nan(height(O),1));
+TO.SpO2Label = getStringCol(O, {'Label'}, "Unknown");
+% --- always create every expected logical column first ---
+TO.HasDesaturation = getLogicalColOrDefault(O, {'HasDesaturation'}, false(height(O),1));
+TO.HasBorderlineDrop = getLogicalColOrDefault(O, {'HasBorderlineDrop'}, false(height(O),1));
+TO.HasShortDropOver3 = getLogicalColOrDefault(O, {'HasShortDropOver3','HasShortDropOver3Percent'}, false(height(O),1));
+TO.HasHighVariability = getLogicalColOrDefault(O, {'HasHighVariability'}, false(height(O),1));
+TO.HasLowOxygenReserve = getLogicalColOrDefault(O, {'HasLowOxygenReserve'}, false(height(O),1));
+TO.HasHighInstabilityBurden = getLogicalColOrDefault(O, {'HasHighInstabilityBurden'}, false(height(O),1));
+TO.HasRecoveryLikeBehavior = getLogicalColOrDefault(O, {'HasRecoveryLikeBehavior'}, false(height(O),1));
+TO.HasStrongSupportiveInstability = getLogicalColOrDefault(O, {'HasStrongSupportiveInstability'}, false(height(O),1));
+TO.SpO2PoorSignal = getLogicalColOrDefault(O, {'PoorSignal'}, false(height(O),1));
+if ~isempty(OC)
+   TO2 = table();
+   TO2.Epoch = getNumericCol(OC, {'EpochNumber','Epoch'});
+   % create all expected contextual columns, even if missing in file
+   TO2.HasBorderlineDrop = getLogicalColOrDefault(OC, {'HasBorderlineDrop'}, false(height(OC),1));
+   TO2.HasShortDropOver3 = getLogicalColOrDefault(OC, {'HasShortDropOver3','HasShortDropOver3Percent'}, false(height(OC),1));
+   TO2.HasHighVariability = getLogicalColOrDefault(OC, {'HasHighVariability'}, false(height(OC),1));
+   TO2.HasLowOxygenReserve = getLogicalColOrDefault(OC, {'HasLowOxygenReserve'}, false(height(OC),1));
+   TO2.HasHighInstabilityBurden = getLogicalColOrDefault(OC, {'HasHighInstabilityBurden'}, false(height(OC),1));
+   TO2.HasRecoveryLikeBehavior = getLogicalColOrDefault(OC, {'HasRecoveryLikeBehavior'}, false(height(OC),1));
+   TO2.HasStrongSupportiveInstability = getLogicalColOrDefault(OC, {'HasStrongSupportiveInstability'}, false(height(OC),1));
+   TO2.PoorSignal = getLogicalColOrDefault(OC, {'PoorSignal'}, false(height(OC),1));
+   TO = outerjoin(TO, TO2, 'Keys','Epoch', 'MergeKeys',true, 'Type','left');
+   % combine left/right safely
+   TO.HasBorderlineDrop = mergeBoolCols(TO, 'HasBorderlineDrop_TO', 'HasBorderlineDrop_TO2', false(height(TO),1));
+   TO.HasShortDropOver3 = mergeBoolCols(TO, 'HasShortDropOver3_TO', 'HasShortDropOver3_TO2', false(height(TO),1));
+   TO.HasHighVariability = mergeBoolCols(TO, 'HasHighVariability_TO', 'HasHighVariability_TO2', false(height(TO),1));
+   TO.HasLowOxygenReserve = mergeBoolCols(TO, 'HasLowOxygenReserve_TO', 'HasLowOxygenReserve_TO2', false(height(TO),1));
+   TO.HasHighInstabilityBurden = mergeBoolCols(TO, 'HasHighInstabilityBurden_TO', 'HasHighInstabilityBurden_TO2', false(height(TO),1));
+   TO.HasRecoveryLikeBehavior = mergeBoolCols(TO, 'HasRecoveryLikeBehavior_TO', 'HasRecoveryLikeBehavior_TO2', false(height(TO),1));
+   TO.HasStrongSupportiveInstability = mergeBoolCols(TO, 'HasStrongSupportiveInstability_TO', 'HasStrongSupportiveInstability_TO2', false(height(TO),1));
+   TO.SpO2PoorSignal = mergeBoolCols(TO, 'SpO2PoorSignal', 'PoorSignal', false(height(TO),1));
+   % keep only clean columns
+   varsToDrop = intersect( ...
+       {'HasBorderlineDrop_TO','HasBorderlineDrop_TO2', ...
+        'HasShortDropOver3_TO','HasShortDropOver3_TO2', ...
+        'HasHighVariability_TO','HasHighVariability_TO2', ...
+        'HasLowOxygenReserve_TO','HasLowOxygenReserve_TO2', ...
+        'HasHighInstabilityBurden_TO','HasHighInstabilityBurden_TO2', ...
+        'HasRecoveryLikeBehavior_TO','HasRecoveryLikeBehavior_TO2', ...
+        'HasStrongSupportiveInstability_TO','HasStrongSupportiveInstability_TO2', ...
+        'PoorSignal'}, ...
+       TO.Properties.VariableNames);
+   if ~isempty(varsToDrop)
+       TO(:, varsToDrop) = [];
+   end
+end
+% strict SpO2 validator
+TO.SpO2ValidatorStrict = ...
+   (~TO.SpO2PoorSignal) & ...
+   ( TO.HasDesaturation | ...
+     (TO.HasStrongSupportiveInstability & TO.HasShortDropOver3 & TO.HasRecoveryLikeBehavior) );
+%% ------------------------------------------------------------
+% STANDARDIZE HR TABLE
+%% ------------------------------------------------------------
+TH = table();
+TH.Epoch = getNumericCol(H, {'EpochNumber'});
+TH.StartTime_s = getNumericColOrDefault(H, {'EpochStart_sec'}, (TH.Epoch-1)*epochLen_sec);
+TH.EndTime_s   = getNumericColOrDefault(H, {'EpochEnd_sec'}, TH.StartTime_s + epochLen_sec);
+TH.MeanHR = getNumericColOrDefault(H, {'MeanHR'}, nan(height(H),1));
+TH.MedianHR = getNumericColOrDefault(H, {'MedianHR'}, nan(height(H),1));
+TH.MinHR = getNumericColOrDefault(H, {'MinHR'}, nan(height(H),1));
+TH.MaxHR = getNumericColOrDefault(H, {'MaxHR'}, nan(height(H),1));
+TH.StdHR = getNumericColOrDefault(H, {'StdHR'}, nan(height(H),1));
+TH.HRStable   = getLogicalColOrDefault(H, {'HRStable'}, false(height(H),1));
+TH.HRUnstable = getLogicalColOrDefault(H, {'HRUnstable'}, false(height(H),1));
+TH.HRPoorSignal = getLogicalColOrDefault(H, {'PoorSignal'}, false(height(H),1));
+TH.HRLabel = getStringCol(H, {'Label'}, "Unknown");
+THC = table();
+THC.Epoch = getNumericCol(HC, {'EpochNumber'});
+THC.HasSharpRise = getLogicalColOrDefault(HC, {'HasSharpRise'}, false(height(HC),1));
+THC.HasSharpDip = getLogicalColOrDefault(HC, {'HasSharpDip'}, false(height(HC),1));
+THC.HasRecoveryPattern = getLogicalColOrDefault(HC, {'HasRecoveryPattern'}, false(height(HC),1));
+THC.HasAutonomicLikeResponse = getLogicalColOrDefault(HC, {'HasAutonomicLikeResponse'}, false(height(HC),1));
+THC.HasMildSupportiveChange = getLogicalColOrDefault(HC, {'HasMildSupportiveChange'}, false(height(HC),1));
+TH = outerjoin(TH, THC, 'Keys','Epoch', 'MergeKeys',true, 'Type','left');
+fillHRCols = {'HasSharpRise','HasSharpDip','HasRecoveryPattern','HasAutonomicLikeResponse','HasMildSupportiveChange'};
+for i = 1:numel(fillHRCols)
+   if ismember(fillHRCols{i}, TH.Properties.VariableNames)
+       TH.(fillHRCols{i}) = fillmissing(logical(TH.(fillHRCols{i})), 'constant', false);
+   else
+       TH.(fillHRCols{i}) = false(height(TH),1);
+   end
+end
+% STRICTER HR validator
+TH.HRValidatorStrict = ...
+   (~TH.HRPoorSignal) & ...
+   ( TH.HRUnstable | TH.HasAutonomicLikeResponse | TH.HasRecoveryPattern );
+%% ------------------------------------------------------------
+% MERGE ALL BY EPOCH
+%% ------------------------------------------------------------
+T = outerjoin(TA, TS, 'Keys','Epoch', 'MergeKeys',true, 'Type','full');
+T = outerjoin(T, TO, 'Keys','Epoch', 'MergeKeys',true, 'Type','full');
+T = outerjoin(T, TH, 'Keys','Epoch', 'MergeKeys',true, 'Type','full');
+T = sortrows(T, 'Epoch');
+% Canonical StartTime_s
+T.StartTime_s = nan(height(T),1);
+startCandidates = {'StartTime_s_TA','StartTime_s_TS','StartTime_s_TO','StartTime_s_TH','StartTime_s'};
+for i = 1:numel(startCandidates)
+   vn = startCandidates{i};
+   if ismember(vn, T.Properties.VariableNames)
+       v = double(T.(vn));
+       mask = isnan(T.StartTime_s) & isfinite(v);
+       T.StartTime_s(mask) = v(mask);
+   end
+end
+% Canonical EndTime_s
+T.EndTime_s = nan(height(T),1);
+endCandidates = {'EndTime_s_TA','EndTime_s_TS','EndTime_s_TO','EndTime_s_TH','EndTime_s'};
+for i = 1:numel(endCandidates)
+   vn = endCandidates{i};
+   if ismember(vn, T.Properties.VariableNames)
+       v = double(T.(vn));
+       mask = isnan(T.EndTime_s) & isfinite(v);
+       T.EndTime_s(mask) = v(mask);
+   end
+end
+missingStart = isnan(T.StartTime_s);
+T.StartTime_s(missingStart) = (T.Epoch(missingStart)-1) * epochLen_sec;
+missingEnd = isnan(T.EndTime_s);
+T.EndTime_s(missingEnd) = T.StartTime_s(missingEnd) + epochLen_sec;
+% Fill main strings
+strCols = {'AirflowClass','AirflowReason','FinalSnoreSeverity','FinalSoundBinary','SpO2Label','HRLabel'};
+for i = 1:numel(strCols)
+   if ~ismember(strCols{i}, T.Properties.VariableNames)
+       T.(strCols{i}) = repmat("Unknown", height(T), 1);
+   else
+       x = string(T.(strCols{i}));
+       x(ismissing(x)) = "Unknown";
+       T.(strCols{i}) = x;
+   end
+end
+% Fill booleans / numerics
+boolCols = {'AirflowHasFlowReduced','AirflowHasApneaLike','AirflowHasApneaEvent', ...
+           'SoundHasSnore','SoundHasApneaLike','PossibleApneaSupport', ...
+           'HasDesaturation','HasBorderlineDrop','HasShortDropOver3','HasHighVariability', ...
+           'HasLowOxygenReserve','HasHighInstabilityBurden','HasRecoveryLikeBehavior', ...
+           'HasStrongSupportiveInstability','SpO2PoorSignal','SpO2ValidatorStrict', ...
+           'HRStable','HRUnstable','HRPoorSignal','HasSharpRise','HasSharpDip', ...
+           'HasRecoveryPattern','HasAutonomicLikeResponse','HasMildSupportiveChange', ...
+           'HRValidatorStrict'};
+for i = 1:numel(boolCols)
+   if ~ismember(boolCols{i}, T.Properties.VariableNames)
+       T.(boolCols{i}) = false(height(T),1);
+   else
+       T.(boolCols{i}) = fillmissing(logical(T.(boolCols{i})), 'constant', false);
+   end
+end
+numColsZero = {'AirflowNumApneaEvents','AirflowApneaOverlap_s','SnoreCount','SnoreDuration_sec','SnoreBurden_pct', ...
+              'SoftSnoreCount','ModerateSnoreCount','StrongSnoreCount','NoisyBreathingDuration_s', ...
+              'NumApneaLikeEvents','ApneaLikeOverlap_s','DesatDuration_sec'};
+for i = 1:numel(numColsZero)
+   if ~ismember(numColsZero{i}, T.Properties.VariableNames)
+       T.(numColsZero{i}) = zeros(height(T),1);
+   else
+       T.(numColsZero{i}) = fillmissing(T.(numColsZero{i}), 'constant', 0);
+   end
+end
+%% ------------------------------------------------------------
+% LAG-AWARE VALIDATION
+%% ------------------------------------------------------------
+n = height(T);
+T.SpO2Validator_t = T.SpO2ValidatorStrict;
+T.SpO2Validator_t1 = false(n,1);
+if n > 1
+   T.SpO2Validator_t1(1:n-1) = T.SpO2ValidatorStrict(2:n);
+end
+T.SpO2Validator_any = T.SpO2Validator_t | T.SpO2Validator_t1;
+T.PhysioValidationStrict = T.SpO2Validator_any | T.HRValidatorStrict;
+T.StrongValidationStrict = T.SpO2Validator_any & T.HRValidatorStrict;
+%% ------------------------------------------------------------
+% QUALITY / TRUST GATING
+%% ------------------------------------------------------------
+T.AirflowReliable = T.AirflowClass ~= "LowQuality" & T.AirflowClass ~= "Unknown";
+T.SoundReliable   = T.FinalSnoreSeverity ~= "Unknown";
+T.SpO2Reliable    = ~T.SpO2PoorSignal;
+T.HRReliable      = ~T.HRPoorSignal;
+T.PrimaryReliable   = T.AirflowReliable | T.SoundReliable;
+T.ValidatorReliable = T.SpO2Reliable | T.HRReliable;
+T.LowQualityEpoch   = ~T.PrimaryReliable & ~T.ValidatorReliable;
+%% ------------------------------------------------------------
+% PRIMARY CANDIDATES
+%% ------------------------------------------------------------
+T.CandidateApnea = ...
+   T.AirflowHasApneaLike | ...
+   T.SoundHasApneaLike | ...
+   (T.AirflowHasFlowReduced & T.PossibleApneaSupport);
+T.CandidateSnoring = T.SoundHasSnore;
+%% ------------------------------------------------------------
+% MAIN FINAL LABELS (ONLY 3 CLASSES)
+%% ------------------------------------------------------------
+FinalLabel = strings(n,1);
+FusionConfidence = strings(n,1);
+DetailedFusionTag = strings(n,1);
+AirflowDetail = strings(n,1);
+SoundDetail   = strings(n,1);
+SpO2Detail    = strings(n,1);
+HRDetail      = strings(n,1);
+for i = 1:n
+   % -------- detail strings --------
+   if T.AirflowHasApneaLike(i)
+       AirflowDetail(i) = "AirflowApneaLike";
+   elseif T.AirflowHasFlowReduced(i)
+       AirflowDetail(i) = "AirflowReduction";
+   elseif T.AirflowClass(i) == "LowQuality"
+       AirflowDetail(i) = "AirflowLowQuality";
+   else
+       AirflowDetail(i) = "AirflowNormal";
+   end
+   if T.SoundHasApneaLike(i)
+       SoundDetail(i) = "ApneaLikeSound";
+   elseif T.FinalSnoreSeverity(i) == "HeavySnoring"
+       SoundDetail(i) = "HeavySnoring";
+   elseif T.FinalSnoreSeverity(i) == "ModerateSnoring"
+       SoundDetail(i) = "ModerateSnoring";
+   elseif T.FinalSnoreSeverity(i) == "SoftSnoring"
+       SoundDetail(i) = "SoftSnoring";
+   elseif T.SoundHasSnore(i)
+       SoundDetail(i) = "Snoring";
+   else
+       SoundDetail(i) = "SoundNormal";
+   end
+   if T.SpO2PoorSignal(i)
+       SpO2Detail(i) = "SpO2PoorSignal";
+   elseif T.HasDesaturation(i)
+       SpO2Detail(i) = "SpO2Desaturation";
+   elseif T.HasStrongSupportiveInstability(i)
+       SpO2Detail(i) = "SpO2SupportiveInstability";
+   elseif T.SpO2Label(i) ~= "Unknown"
+       SpO2Detail(i) = T.SpO2Label(i);
+   else
+       SpO2Detail(i) = "SpO2Normal";
+   end
+   if T.HRPoorSignal(i)
+       HRDetail(i) = "HRPoorSignal";
+   elseif T.HasAutonomicLikeResponse(i)
+       HRDetail(i) = "AutonomicLikeResponse";
+   elseif T.HasRecoveryPattern(i)
+       HRDetail(i) = "RecoveryPattern";
+   elseif T.HRUnstable(i)
+       HRDetail(i) = "HRUnstable";
+   else
+       HRDetail(i) = "HRStable";
+   end
+   % -------- final main label --------
+   if T.CandidateApnea(i)
+       if T.StrongValidationStrict(i)
+           FinalLabel(i) = "SuspectedApnea";
+           FusionConfidence(i) = "High";
+       elseif T.PhysioValidationStrict(i)
+           FinalLabel(i) = "SuspectedApnea";
+           FusionConfidence(i) = "Moderate";
+       else
+           % apnea candidate but not validated -> keep detection reflected
+           if T.CandidateSnoring(i)
+               FinalLabel(i) = "Snoring";
+               FusionConfidence(i) = "Moderate";
+           else
+               FinalLabel(i) = "Normal";
+               FusionConfidence(i) = "Low";
+           end
+       end
+   else
+       if T.CandidateSnoring(i)
+           FinalLabel(i) = "Snoring";
+           if T.AirflowHasFlowReduced(i)
+               FusionConfidence(i) = "Moderate";
+           else
+               FusionConfidence(i) = "High";
+           end
+       else
+           FinalLabel(i) = "Normal";
+           if T.LowQualityEpoch(i)
+               FusionConfidence(i) = "Low";
+           else
+               FusionConfidence(i) = "High";
+           end
+       end
+   end
+   % -------- detailed fusion tag --------
+   if FinalLabel(i) == "SuspectedApnea"
+       if T.AirflowHasApneaLike(i) && T.SpO2Validator_any(i) && T.HRValidatorStrict(i)
+           DetailedFusionTag(i) = "AirflowApneaLike+SpO2+HR";
+       elseif T.AirflowHasApneaLike(i) && T.SpO2Validator_any(i)
+           DetailedFusionTag(i) = "AirflowApneaLike+SpO2";
+       elseif T.SoundHasApneaLike(i) && T.SpO2Validator_any(i)
+           DetailedFusionTag(i) = "ApneaLikeSound+SpO2";
+       elseif T.SoundHasApneaLike(i) && T.HRValidatorStrict(i)
+           DetailedFusionTag(i) = "ApneaLikeSound+HR";
+       elseif T.AirflowHasFlowReduced(i) && T.PossibleApneaSupport(i) && T.PhysioValidationStrict(i)
+           DetailedFusionTag(i) = "FlowReduction+ApneaSupport+Physio";
+       else
+           DetailedFusionTag(i) = "ValidatedApneaCandidate";
+       end
+   elseif FinalLabel(i) == "Snoring"
+       if T.FinalSnoreSeverity(i) == "HeavySnoring" && T.AirflowHasFlowReduced(i)
+           DetailedFusionTag(i) = "HeavySnoring+FlowReduction";
+       elseif T.FinalSnoreSeverity(i) == "ModerateSnoring" && T.AirflowHasFlowReduced(i)
+           DetailedFusionTag(i) = "ModerateSnoring+FlowReduction";
+       elseif T.FinalSnoreSeverity(i) == "SoftSnoring" && T.AirflowHasFlowReduced(i)
+           DetailedFusionTag(i) = "SoftSnoring+FlowReduction";
+       elseif T.FinalSnoreSeverity(i) == "HeavySnoring"
+           DetailedFusionTag(i) = "HeavySnoring";
+       elseif T.FinalSnoreSeverity(i) == "ModerateSnoring"
+           DetailedFusionTag(i) = "ModerateSnoring";
+       elseif T.FinalSnoreSeverity(i) == "SoftSnoring"
+           DetailedFusionTag(i) = "SoftSnoring";
+       else
+           DetailedFusionTag(i) = "Snoring";
+       end
+   else
+       if T.LowQualityEpoch(i)
+           DetailedFusionTag(i) = "NormalButLowQuality";
+       elseif T.AirflowHasFlowReduced(i) && ~T.CandidateSnoring(i)
+           DetailedFusionTag(i) = "FlowReductionWithoutValidation";
+       else
+           DetailedFusionTag(i) = "Normal";
+       end
+   end
+end
+T.FinalLabel = FinalLabel;
+T.FusionConfidence = FusionConfidence;
+T.AirflowDetail = AirflowDetail;
+T.SoundDetail = SoundDetail;
+T.SpO2Detail = SpO2Detail;
+T.HRDetail = HRDetail;
+T.DetailedFusionTag = DetailedFusionTag;
+%% ------------------------------------------------------------
+% NIGHT-LEVEL SUMMARY + INTERPRETATION
+%% ------------------------------------------------------------
+nEpochs = height(T);
+nNormal = sum(T.FinalLabel == "Normal");
+nSnoring = sum(T.FinalLabel == "Snoring");
+nApnea = sum(T.FinalLabel == "SuspectedApnea");
+pctNormal  = 100*nNormal/max(nEpochs,1);
+pctSnoring = 100*nSnoring/max(nEpochs,1);
+pctApnea   = 100*nApnea/max(nEpochs,1);
+pctFlowReduced = 100*mean(T.AirflowHasFlowReduced);
+pctAirflowApneaLike = 100*mean(T.AirflowHasApneaLike);
+pctSoundApneaLike = 100*mean(T.SoundHasApneaLike);
+pctHeavySnoring = 100*mean(T.FinalSnoreSeverity == "HeavySnoring");
+pctModerateSnoring = 100*mean(T.FinalSnoreSeverity == "ModerateSnoring");
+pctSpO2Validated = 100*mean(T.SpO2Validator_any);
+pctHRValidated = 100*mean(T.HRValidatorStrict);
+NightLabel = "";
+NightInterpretation = "";
+if pctApnea >= 15
+   if pctSnoring >= 20
+       NightLabel = "ApneaSuspiciousMixedPattern";
+       NightInterpretation = "Apnea-suspicious mixed respiratory pattern";
+   else
+       NightLabel = "ApneaDominantPattern";
+       NightInterpretation = "Apnea-dominant respiratory disturbance pattern";
+   end
+elseif pctApnea >= 5
+   if pctSnoring >= 25 && pctFlowReduced >= 20
+       NightLabel = "SnoringDominantHypopneaLikePattern";
+       NightInterpretation = "Snoring-dominant hypopnea-like pattern with recurrent airflow reduction";
+   elseif pctSnoring >= 25
+       NightLabel = "SnoringDominantWithIntermittentApneaSuspicion";
+       NightInterpretation = "Snoring-dominant pattern with intermittent apnea-like events";
+   else
+       NightLabel = "MildApneaSuspiciousPattern";
+       NightInterpretation = "Mild apnea-suspicious pattern";
+   end
+else
+   if pctSnoring >= 30 && pctFlowReduced >= 20
+       NightLabel = "SnoringDominantWithFlowReduction";
+       NightInterpretation = "Snoring-dominant pattern with recurrent airflow reduction";
+   elseif pctSnoring >= 30
+       NightLabel = "SnoringDominantPattern";
+       NightInterpretation = "Snoring-dominant breathing pattern";
+   elseif pctFlowReduced >= 20
+       NightLabel = "FlowReductionPattern";
+       NightInterpretation = "Flow-reduction dominant pattern without strong physiologic confirmation";
+   else
+       NightLabel = "PredominantlyNormalPattern";
+       NightInterpretation = "Predominantly normal breathing pattern";
+   end
+end
+Summary = table();
+Summary.TotalEpochs = nEpochs;
+Summary.NormalEpochs = nNormal;
+Summary.SnoringEpochs = nSnoring;
+Summary.SuspectedApneaEpochs = nApnea;
+Summary.NormalPct = pctNormal;
+Summary.SnoringPct = pctSnoring;
+Summary.SuspectedApneaPct = pctApnea;
+Summary.FlowReducedPct = pctFlowReduced;
+Summary.AirflowApneaLikePct = pctAirflowApneaLike;
+Summary.SoundApneaLikePct = pctSoundApneaLike;
+Summary.HeavySnoringPct = pctHeavySnoring;
+Summary.ModerateSnoringPct = pctModerateSnoring;
+Summary.SpO2ValidatedPct = pctSpO2Validated;
+Summary.HRValidatedPct = pctHRValidated;
+Summary.NightLabel = string(NightLabel);
+Summary.NightInterpretation = string(NightInterpretation);
+%% ------------------------------------------------------------
+% MOST RELEVANT 3-MIN WINDOW SELECTION
+%% ------------------------------------------------------------
+score = zeros(n,1);
+score = score + 8*(T.FinalLabel == "SuspectedApnea");
+score = score + 4*(T.CandidateApnea);
+score = score + 3*(T.SoundHasApneaLike);
+score = score + 2*(T.AirflowHasApneaLike);
+score = score + 2*(T.AirflowHasFlowReduced);
+score = score + 1.5*(T.FinalSnoreSeverity == "HeavySnoring");
+score = score + 1.0*(T.FinalSnoreSeverity == "ModerateSnoring");
+score = score + 1.0*T.SpO2Validator_any;
+score = score + 0.75*T.HRValidatorStrict;
+epochsPerZoom = round(zoomWin_sec / epochLen_sec);
+if epochsPerZoom < 1
+   epochsPerZoom = 1;
+end
+rollingScore = zeros(n,1);
+for i = 1:n
+   j2 = min(n, i + epochsPerZoom - 1);
+   rollingScore(i) = sum(score(i:j2));
+end
+[~, bestStartIdx] = max(rollingScore);
+bestEndIdx = min(n, bestStartIdx + epochsPerZoom - 1);
+zoomStart_s = T.StartTime_s(bestStartIdx);
+zoomEnd_s   = min(T.EndTime_s(bestEndIdx), zoomStart_s + zoomWin_sec);
+RelevantWindow = table(zoomStart_s, zoomEnd_s, bestStartIdx, bestEndIdx, rollingScore(bestStartIdx), ...
+   'VariableNames', {'ZoomStart_s','ZoomEnd_s','StartEpochRow','EndEpochRow','WindowScore'});
+%% ------------------------------------------------------------
+% SAVE FUSED TABLE
+%% ------------------------------------------------------------
+Fused = table();
+Fused.Epoch = T.Epoch;
+Fused.StartTime_s = T.StartTime_s;
+Fused.EndTime_s = T.EndTime_s;
+Fused.FinalLabel = T.FinalLabel;
+Fused.FusionConfidence = T.FusionConfidence;
+Fused.DetailedFusionTag = T.DetailedFusionTag;
+Fused.AirflowClass = T.AirflowClass;
+Fused.AirflowDetail = T.AirflowDetail;
+Fused.AirflowHasFlowReduced = T.AirflowHasFlowReduced;
+Fused.AirflowHasApneaLike = T.AirflowHasApneaLike;
+Fused.AirflowApneaOverlap_s = T.AirflowApneaOverlap_s;
+Fused.RespiratoryRate_bpm = T.RespiratoryRate_bpm;
+Fused.FinalSnoreSeverity = T.FinalSnoreSeverity;
+Fused.SoundDetail = T.SoundDetail;
+Fused.SoundHasSnore = T.SoundHasSnore;
+Fused.SoundHasApneaLike = T.SoundHasApneaLike;
+Fused.SnoreCount = T.SnoreCount;
+Fused.SnoreDuration_sec = T.SnoreDuration_sec;
+Fused.SnoreBurden_pct = T.SnoreBurden_pct;
+Fused.PossibleApneaSupport = T.PossibleApneaSupport;
+Fused.ApneaLikeOverlap_s = T.ApneaLikeOverlap_s;
+Fused.SpO2Label = T.SpO2Label;
+Fused.SpO2Detail = T.SpO2Detail;
+Fused.MeanSpO2 = getColIfExists(T, 'MeanSpO2', nan(n,1));
+Fused.MinSpO2 = getColIfExists(T, 'MinSpO2', nan(n,1));
+Fused.DropMagnitude = getColIfExists(T, 'DropMagnitude', nan(n,1));
+Fused.HasDesaturation = T.HasDesaturation;
+Fused.HasStrongSupportiveInstability = T.HasStrongSupportiveInstability;
+Fused.SpO2PoorSignal = T.SpO2PoorSignal;
+Fused.SpO2Validator_t = T.SpO2Validator_t;
+Fused.SpO2Validator_t1 = T.SpO2Validator_t1;
+Fused.SpO2Validator_any = T.SpO2Validator_any;
+Fused.HRLabel = T.HRLabel;
+Fused.HRDetail = T.HRDetail;
+Fused.MeanHR = getColIfExists(T, 'MeanHR', nan(n,1));
+Fused.StdHR = getColIfExists(T, 'StdHR', nan(n,1));
+Fused.HRUnstable = T.HRUnstable;
+Fused.HRPoorSignal = T.HRPoorSignal;
+Fused.HasSharpRise = T.HasSharpRise;
+Fused.HasSharpDip = T.HasSharpDip;
+Fused.HasRecoveryPattern = T.HasRecoveryPattern;
+Fused.HasAutonomicLikeResponse = T.HasAutonomicLikeResponse;
+Fused.HRValidatorStrict = T.HRValidatorStrict;
+Fused.CandidateApnea = T.CandidateApnea;
+Fused.CandidateSnoring = T.CandidateSnoring;
+Fused.PhysioValidationStrict = T.PhysioValidationStrict;
+Fused.StrongValidationStrict = T.StrongValidationStrict;
+Fused.PrimaryReliable = T.PrimaryReliable;
+Fused.ValidatorReliable = T.ValidatorReliable;
+Fused.LowQualityEpoch = T.LowQualityEpoch;
+fusedFile = fullfile(outDir, 'zensnore_fused_epoch_table.csv');
+summaryFile = fullfile(outDir, 'zensnore_night_summary.csv');
+windowFile = fullfile(outDir, 'zensnore_most_relevant_window.csv');
+writetable(Fused, fusedFile);
+writetable(Summary, summaryFile);
+writetable(RelevantWindow, windowFile);
+%% ------------------------------------------------------------
+% PRINT DIAGNOSTICS
+%% ------------------------------------------------------------
+fprintf('\nMerged total epochs: %d\n', nEpochs);
+fprintf('\n================ STRICT VALIDATOR COUNTS ================\n');
+fprintf('SpO2 HasDesaturation                : %d\n', sum(T.HasDesaturation));
+fprintf('SpO2 StrongSupportiveInstability    : %d\n', sum(T.HasStrongSupportiveInstability));
+fprintf('SpO2 Validator (strict, t)          : %d\n', sum(T.SpO2Validator_t));
+fprintf('SpO2 Validator (strict, t+1)        : %d\n', sum(T.SpO2Validator_t1));
+fprintf('SpO2 Validator (strict, any)        : %d\n', sum(T.SpO2Validator_any));
+fprintf('HR Unstable                         : %d\n', sum(T.HRUnstable));
+fprintf('HR RecoveryPattern                  : %d\n', sum(T.HasRecoveryPattern));
+fprintf('HR AutonomicLikeResponse            : %d\n', sum(T.HasAutonomicLikeResponse));
+fprintf('HR Validator (strict)               : %d\n', sum(T.HRValidatorStrict));
+fprintf('\n================ PRIMARY DETECTION COUNTS ================\n');
+fprintf('AirflowHasFlowReduced               : %d\n', sum(T.AirflowHasFlowReduced));
+fprintf('AirflowHasApneaLike                 : %d\n', sum(T.AirflowHasApneaLike));
+fprintf('SoundHasSnore                       : %d\n', sum(T.SoundHasSnore));
+fprintf('SoundHasApneaLike                   : %d\n', sum(T.SoundHasApneaLike));
+fprintf('CandidateApnea                      : %d\n', sum(T.CandidateApnea));
+fprintf('CandidateSnoring                    : %d\n', sum(T.CandidateSnoring));
+fprintf('\n================ FUSION SUMMARY ==========================\n');
+fprintf('Normal epochs                       : %d\n', nNormal);
+fprintf('Snoring epochs                      : %d\n', nSnoring);
+fprintf('SuspectedApnea epochs               : %d\n', nApnea);
+fprintf('Night label                         : %s\n', NightLabel);
+fprintf('Night interpretation                : %s\n', NightInterpretation);
+fprintf('==========================================================\n');
+fprintf('\nMost relevant 3-minute window:\n');
+fprintf('Start time                          : %.2f s\n', zoomStart_s);
+fprintf('End time                            : %.2f s\n', zoomEnd_s);
+%% ------------------------------------------------------------
+% PLOT RELEVANT 3-MIN WINDOW
+%% ------------------------------------------------------------
+fprintf('\nGenerating plots...\n');
+% -------- Load helper traces --------
+airflowTrace = [];
+if isfile(airflowTraceFile)
+   airflowTrace = readtable(airflowTraceFile);
+end
+soundWins = [];
+if isfile(soundWindowFile)
+   soundWins = readtable(soundWindowFile);
+end
+spo2Raw = [];
+if isfile(spo2RawFile)
+   spo2Raw = readtable(spo2RawFile);
+end
+spo2Clean = [];
+if isfile(spo2CleanFile)
+   spo2Clean = readtable(spo2CleanFile);
+end
+hrProc = [];
+if isfile(hrProcFile)
+   hrProc = readtable(hrProcFile);
+end
+hrTrace = [];
+if isfile(hrTraceFile)
+   hrTrace = readtable(hrTraceFile);
+end
+% -------- Figure 1: overview with 4 panels --------
+f1 = figure('Color','w','Position',[80 60 1500 950]);
+subplot(4,1,1);
+hold on;
+title(sprintf('Airflow (%.1f to %.1f s)', zoomStart_s, zoomEnd_s));
+plotAirflowPanel(airflowTrace, T, zoomStart_s, zoomEnd_s);
+ylabel('kPa');
+grid on;
+subplot(4,1,2);
+hold on;
+title('Sound');
+plotSoundPanel(soundWins, rawAudioFile, rawAudio1File, rawAudio2File, T, zoomStart_s, zoomEnd_s);
+ylabel('Amplitude / RMS');
+grid on;
+subplot(4,1,3);
+hold on;
+title('SpO2');
+plotSpO2Panel(spo2Raw, spo2Clean, T, zoomStart_s, zoomEnd_s);
+ylabel('SpO2 (%)');
+grid on;
+subplot(4,1,4);
+hold on;
+title('HR / PPG');
+plotHRPanel(hrProc, hrTrace, rawPPGFile, T, zoomStart_s, zoomEnd_s);
+ylabel('PPG / HR');
+xlabel('Time (s)');
+grid on;
+sgtitle(sprintf('ZenSnore Most Relevant 3-Minute Window | %s', NightInterpretation), 'FontWeight','bold');
+saveas(f1, fullfile(outDir, 'fusion_relevant_window_overview.png'));
+% -------- Figure 2: airflow only --------
+f2 = figure('Color','w','Position',[80 80 1500 420]);
+hold on;
+plotAirflowPanel(airflowTrace, T, zoomStart_s, zoomEnd_s);
+title(sprintf('Airflow Detailed Window | %s', NightInterpretation));
+ylabel('kPa');
+xlabel('Time (s)');
+grid on;
+saveas(f2, fullfile(outDir, 'fusion_relevant_window_airflow.png'));
+% -------- Figure 3: sound only --------
+f3 = figure('Color','w','Position',[80 80 1500 420]);
+hold on;
+plotSoundPanel(soundWins, rawAudioFile, rawAudio1File, rawAudio2File, T, zoomStart_s, zoomEnd_s);
+title(sprintf('Sound Detailed Window | %s', NightInterpretation));
+ylabel('Amplitude / RMS');
+xlabel('Time (s)');
+grid on;
+saveas(f3, fullfile(outDir, 'fusion_relevant_window_sound.png'));
+% -------- Figure 4: SpO2 only --------
+f4 = figure('Color','w','Position',[80 80 1500 420]);
+hold on;
+plotSpO2Panel(spo2Raw, spo2Clean, T, zoomStart_s, zoomEnd_s);
+title(sprintf('SpO2 Detailed Window | %s', NightInterpretation));
+ylabel('SpO2 (%)');
+xlabel('Time (s)');
+grid on;
+saveas(f4, fullfile(outDir, 'fusion_relevant_window_spo2.png'));
+% -------- Figure 5: HR only --------
+f5 = figure('Color','w','Position',[80 80 1500 420]);
+hold on;
+plotHRPanel(hrProc, hrTrace, rawPPGFile, T, zoomStart_s, zoomEnd_s);
+title(sprintf('HR Detailed Window | %s', NightInterpretation));
+ylabel('PPG / HR');
+xlabel('Time (s)');
+grid on;
+saveas(f5, fullfile(outDir, 'fusion_relevant_window_hr.png'));
+fprintf('\nSaved files:\n');
+fprintf(' - %s\n', fusedFile);
+fprintf(' - %s\n', summaryFile);
+fprintf(' - %s\n', windowFile);
+fprintf(' - %s\n', fullfile(outDir, 'fusion_relevant_window_overview.png'));
+fprintf(' - %s\n', fullfile(outDir, 'fusion_relevant_window_airflow.png'));
+fprintf(' - %s\n', fullfile(outDir, 'fusion_relevant_window_sound.png'));
+fprintf(' - %s\n', fullfile(outDir, 'fusion_relevant_window_spo2.png'));
+fprintf(' - %s\n', fullfile(outDir, 'fusion_relevant_window_hr.png'));
+fprintf('\nDone.\n');
+%% ============================================================
+% LOCAL FUNCTIONS
+%% ============================================================
+function x = getNumericCol(T, names)
+x = [];
+for k = 1:numel(names)
+   if ismember(names{k}, T.Properties.VariableNames)
+       x = double(T.(names{k}));
+       return;
+   end
+end
+error('Missing required numeric column. Tried: %s', strjoin(names, ', '));
+end
+function x = getNumericColOrDefault(T, names, defaultVal)
+for k = 1:numel(names)
+   if ismember(names{k}, T.Properties.VariableNames)
+       x = double(T.(names{k}));
+       return;
+   end
+end
+x = defaultVal;
+end
+function x = getLogicalColOrDefault(T, names, defaultVal)
+for k = 1:numel(names)
+   if ismember(names{k}, T.Properties.VariableNames)
+       x = logical(T.(names{k}));
+       return;
+   end
+end
+x = defaultVal;
+end
+function x = getStringCol(T, names, defaultVal)
+for k = 1:numel(names)
+   if ismember(names{k}, T.Properties.VariableNames)
+       x = string(T.(names{k}));
+       x(ismissing(x)) = defaultVal;
+       return;
+   end
+end
+x = repmat(string(defaultVal), height(T), 1);
+end
+function x = getColIfExists(T, name, defaultVal)
+if ismember(name, T.Properties.VariableNames)
+   x = T.(name);
+else
+   x = defaultVal;
+end
+end
+function x = mergeBoolCols(T, leftName, rightName, fallback)
+if nargin < 4
+   fallback = false(height(T),1);
+end
+x = fallback;
+if ismember(leftName, T.Properties.VariableNames)
+   x = x | fillmissing(logical(T.(leftName)), 'constant', false);
+end
+if ismember(rightName, T.Properties.VariableNames)
+   x = x | fillmissing(logical(T.(rightName)), 'constant', false);
+end
+end
+function plotEpochShading(ax, T, zoomStart_s, zoomEnd_s)
+axes(ax);
+hold(ax, 'on');
+idx = (T.StartTime_s < zoomEnd_s) & (T.EndTime_s > zoomStart_s);
+Te = T(idx,:);
+if isempty(Te)
+   return;
+end
+yl = ylim(ax);
+for i = 1:height(Te)
+   xs = [Te.StartTime_s(i) Te.EndTime_s(i) Te.EndTime_s(i) Te.StartTime_s(i)];
+   ys = [yl(1) yl(1) yl(2) yl(2)];
+   if Te.FinalLabel(i) == "SuspectedApnea"
+       faceAlpha = 0.12;
+   elseif Te.FinalLabel(i) == "Snoring"
+       faceAlpha = 0.08;
+   else
+       faceAlpha = 0.03;
+   end
+   patch(ax, xs, ys, [0.5 0.5 0.5], ...
+       'FaceAlpha', faceAlpha, ...
+       'EdgeColor', 'none', ...
+       'HandleVisibility', 'off');
+   ytxt = yl(2) - 0.08*(yl(2)-yl(1));
+   text(ax, Te.StartTime_s(i)+1, ytxt, ...
+       sprintf('E%d %s', Te.Epoch(i), Te.FinalLabel(i)), ...
+       'FontSize', 7, ...
+       'Clipping', 'on');
+end
+end
+function plotAirflowPanel(airflowTrace, T, zoomStart_s, zoomEnd_s)
+ax = gca;
+hold on;
+if ~isempty(airflowTrace)
+   t = getNumericCol(airflowTrace, {'Time_s'});
+   idx = (t >= zoomStart_s) & (t <= zoomEnd_s);
+   if any(idx)
+       if ismember('AirflowRaw', airflowTrace.Properties.VariableNames)
+           plot(t(idx), airflowTrace.AirflowRaw(idx), 'DisplayName','Raw');
+       end
+       if ismember('AirflowFiltered', airflowTrace.Properties.VariableNames)
+           plot(t(idx), airflowTrace.AirflowFiltered(idx), 'LineWidth',1.2, 'DisplayName','Filtered');
+       end
+       if ismember('Envelope', airflowTrace.Properties.VariableNames)
+           plot(t(idx), airflowTrace.Envelope(idx), 'LineWidth',1.1, 'DisplayName','Envelope');
+       end
+       if ismember('LocalBaseline', airflowTrace.Properties.VariableNames)
+           plot(t(idx), airflowTrace.LocalBaseline(idx)*0.10, '--', 'LineWidth',1.0, 'DisplayName','10% Baseline');
+       end
+   end
+else
+   text(mean([zoomStart_s zoomEnd_s]), 0, 'Airflow trace not found', 'HorizontalAlignment','center');
+end
+xlim([zoomStart_s zoomEnd_s]);
+plotEpochShading(ax, T, zoomStart_s, zoomEnd_s);
+legend('show','Location','best');
+end
+function plotSoundPanel(soundWins, rawAudioFile, rawAudio1File, rawAudio2File, T, zoomStart_s, zoomEnd_s)
+ax = gca;
+hold on;
+audioLoaded = false;
+try
+   if isfile(rawAudioFile)
+       info = audioinfo(rawAudioFile);
+       fs = info.SampleRate;
+       s1 = max(1, floor(zoomStart_s*fs)+1);
+       s2 = min(info.TotalSamples, ceil(zoomEnd_s*fs));
+       [y, fs] = audioread(rawAudioFile, [s1 s2]);
+       if size(y,2) > 1, y = mean(y,2); end
+       t = ((0:numel(y)-1)'/fs) + zoomStart_s;
+       plot(t, y, 'DisplayName','Audio Raw');
+       [b,a] = butter(4, [20 300]/(fs/2), 'bandpass');
+       yf = filtfilt(b,a,y);
+       env = movmean(abs(yf), max(5, round(0.03*fs)));
+       plot(t, yf, 'LineWidth',1.0, 'DisplayName','Audio Filtered');
+       plot(t, env, 'LineWidth',1.4, 'DisplayName','Envelope');
+       audioLoaded = true;
+   elseif isfile(rawAudio1File) && isfile(rawAudio2File)
+       % Fallback: plot window features only if merged audio not available
+       audioLoaded = false;
+   end
+catch
+   audioLoaded = false;
+end
+if ~audioLoaded
+   if ~isempty(soundWins)
+       t1 = getNumericCol(soundWins, {'start_time_s'});
+       t2 = getNumericCol(soundWins, {'end_time_s'});
+       mid = (t1 + t2)/2;
+       idx = (mid >= zoomStart_s) & (mid <= zoomEnd_s);
+       if any(idx)
+           if ismember('rms', soundWins.Properties.VariableNames)
+               plot(mid(idx), soundWins.rms(idx), '-o', 'DisplayName','RMS');
+           end
+           if ismember('rms_norm', soundWins.Properties.VariableNames)
+               plot(mid(idx), soundWins.rms_norm(idx), '-s', 'LineWidth',1.1, 'DisplayName','RMS norm');
+           end
+           if ismember('peak_freq_hz', soundWins.Properties.VariableNames)
+               yyaxis right
+               plot(mid(idx), soundWins.peak_freq_hz(idx), 'DisplayName','Peak Freq');
+               ylabel('Hz');
+               yyaxis left
+           end
+       else
+           text(mean([zoomStart_s zoomEnd_s]), 0, 'No sound windows in zoom range', 'HorizontalAlignment','center');
+       end
+   else
+       text(mean([zoomStart_s zoomEnd_s]), 0, 'Sound trace not found', 'HorizontalAlignment','center');
+   end
+end
+xlim([zoomStart_s zoomEnd_s]);
+plotEpochShading(ax, T, zoomStart_s, zoomEnd_s);
+legend('show','Location','best');
+end
+function plotSpO2Panel(spo2Raw, spo2Clean, T, zoomStart_s, zoomEnd_s)
+ax = gca;
+hold on;
+plotted = false;
+if ~isempty(spo2Raw)
+   t = getNumericCol(spo2Raw, {'Time_sec','time_s','Time_s'});
+   idx = (t >= zoomStart_s) & (t <= zoomEnd_s);
+   if any(idx)
+       if ismember('SpO2_raw', spo2Raw.Properties.VariableNames)
+           plot(t(idx), spo2Raw.SpO2_raw(idx), 'DisplayName','SpO2 raw');
+           plotted = true;
+       end
+   end
+end
+if ~isempty(spo2Clean)
+   t = getNumericCol(spo2Clean, {'Time_sec','time_s','Time_s'});
+   idx = (t >= zoomStart_s) & (t <= zoomEnd_s);
+   if any(idx)
+       if ismember('SpO2_clean', spo2Clean.Properties.VariableNames)
+           plot(t(idx), spo2Clean.SpO2_clean(idx), 'LineWidth',1.3, 'DisplayName','SpO2 clean');
+           plotted = true;
+       end
+   end
+end
+Te = T((T.StartTime_s < zoomEnd_s) & (T.EndTime_s > zoomStart_s), :);
+if ~isempty(Te)
+   mid = (Te.StartTime_s + Te.EndTime_s)/2;
+   if ismember('MeanSpO2', Te.Properties.VariableNames)
+       plot(mid, Te.MeanSpO2, 'o-', 'LineWidth',1.2, 'DisplayName','Epoch Mean SpO2');
+   end
+end
+if ~plotted && isempty(Te)
+   text(mean([zoomStart_s zoomEnd_s]), 95, 'SpO2 trace not found', 'HorizontalAlignment','center');
+end
+xlim([zoomStart_s zoomEnd_s]);
+plotEpochShading(ax, T, zoomStart_s, zoomEnd_s);
+legend('show','Location','best');
+end
+function plotHRPanel(hrProc, hrTrace, rawPPGFile, T, zoomStart_s, zoomEnd_s)
+ax = gca;
+hold on;
+plotted = false;
+% raw RED from ppg.csv if available
+if isfile(rawPPGFile)
+   try
+       P = readtable(rawPPGFile);
+       if ismember('t_ns', P.Properties.VariableNames)
+           t = double(P.t_ns)*1e-9;
+           t = t - t(1);
+       elseif ismember('time_s', P.Properties.VariableNames)
+           t = double(P.time_s);
+       else
+           t = [];
+       end
+       if ~isempty(t)
+           if ismember('RED', P.Properties.VariableNames)
+               idx = (t >= zoomStart_s) & (t <= zoomEnd_s);
+               if any(idx)
+                   plot(t(idx), double(P.RED(idx)), 'DisplayName','PPG RED raw');
+                   plotted = true;
+               end
+           end
+       end
+   catch
+   end
+end
+if ~isempty(hrProc)
+   t = getNumericCol(hrProc, {'time_s'});
+   idx = (t >= zoomStart_s) & (t <= zoomEnd_s);
+   if any(idx)
+       if ismember('RED_screened', hrProc.Properties.VariableNames)
+           plot(t(idx), hrProc.RED_screened(idx), 'LineWidth',1.0, 'DisplayName','RED screened');
+           plotted = true;
+       end
+       if ismember('RED_filtered', hrProc.Properties.VariableNames)
+           plot(t(idx), hrProc.RED_filtered(idx), 'LineWidth',1.2, 'DisplayName','RED filtered');
+           plotted = true;
+       end
+   end
+end
+if ~isempty(hrTrace)
+   t2 = getNumericCol(hrTrace, {'time_s'});
+   idx2 = (t2 >= zoomStart_s) & (t2 <= zoomEnd_s);
+   if any(idx2)
+       yyaxis right
+       if ismember('hr_bpm', hrTrace.Properties.VariableNames)
+           plot(t2(idx2), hrTrace.hr_bpm(idx2), '-o', 'DisplayName','HR bpm');
+       end
+       if ismember('hr_smooth_bpm', hrTrace.Properties.VariableNames)
+           plot(t2(idx2), hrTrace.hr_smooth_bpm(idx2), 'LineWidth',1.4, 'DisplayName','HR smooth');
+       end
+       ylabel('HR (bpm)');
+       yyaxis left
+       plotted = true;
+   end
+end
+if ~plotted
+   text(mean([zoomStart_s zoomEnd_s]), 0, 'HR trace not found', 'HorizontalAlignment','center');
+end
+xlim([zoomStart_s zoomEnd_s]);
+plotEpochShading(ax, T, zoomStart_s, zoomEnd_s);
+legend('show','Location','best');
+end
+
